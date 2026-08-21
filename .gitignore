@@ -1,0 +1,14 @@
+# инструментальное окружение, не часть проекта
+.claude/
+.vscode/
+
+# build output
+bin/
+obj/
+out/
+*.user
+
+# runtime files, not part of the source
+TrayMon.json
+smartctl.exe
+drivedb.h
