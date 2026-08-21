@@ -1,6 +1,7 @@
 # инструментальное окружение, не часть проекта
 .claude/
 .vscode/
+.sanitize-patterns*
 
 # build output
 bin/
