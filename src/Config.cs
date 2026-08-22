@@ -14,6 +14,9 @@ public sealed class IconSettings
 	/// <summary>Tooltip caption; null keeps the built-in one.</summary>
 	public string Label { get; set; }
 
+	/// <summary>Colour of the digits: "light", "dark", or null to pick by the plate colour.</summary>
+	public string Ink { get; set; }
+
 	/// <summary>Value at which the plate turns yellow; null keeps the built-in threshold.
 	/// Set both this and <see cref="Crit"/> above any reachable value to switch the
 	/// threshold colouring off and always see the chosen plate colour.</summary>
@@ -21,6 +24,37 @@ public sealed class IconSettings
 
 	/// <summary>Value at which the plate turns red; null keeps the built-in threshold.</summary>
 	public double? Crit { get; set; }
+}
+
+/// <summary>
+/// Where to ask for the UPS reading. The defaults fit a UPS on a serial port of this machine,
+/// published over SNMP by PowerChute; another host or community only needs the file edited.
+/// The setters keep the default when the file hands over an empty value — the file is meant to
+/// be edited by hand, and a blank community must not stop the program from starting.
+/// </summary>
+public sealed class UpsSettings
+{
+	private string _host = "127.0.0.1";
+	private int _port = 161;
+	private string _community = "PowerChuteUser";
+
+	public string Host
+	{
+		get => _host;
+		set { if (!string.IsNullOrWhiteSpace(value)) _host = value; }
+	}
+
+	public int Port
+	{
+		get => _port;
+		set { if (value is > 0 and <= 65535) _port = value; }
+	}
+
+	public string Community
+	{
+		get => _community;
+		set { if (!string.IsNullOrWhiteSpace(value)) _community = value; }
+	}
 }
 
 /// <summary>
@@ -37,6 +71,8 @@ public sealed class Config
 
 	public Dictionary<string, IconSettings> Icons { get; set; } = new();
 
+	public UpsSettings Ups { get; set; } = new();
+
 	[JsonIgnore]
 	public static string Path => System.IO.Path.Combine(AppContext.BaseDirectory, "TrayMon.json");
 
@@ -45,7 +81,11 @@ public sealed class Config
 		try
 		{
 			if (File.Exists(Path))
-				return JsonSerializer.Deserialize<Config>(File.ReadAllText(Path), JsonOptions) ?? new Config();
+			{
+				var config = JsonSerializer.Deserialize<Config>(File.ReadAllText(Path), JsonOptions) ?? new Config();
+				config.Ups ??= new UpsSettings();   // "Ups": null in a hand-edited file
+				return config;
+			}
 		}
 		catch (Exception)
 		{

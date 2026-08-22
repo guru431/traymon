@@ -46,6 +46,10 @@ internal static class Program
 		var hdd = new HddSensor();
 		sw.Restart(); r.RaidDisks = hdd.ReadAll(); var tRaid = sw.Elapsed.TotalMilliseconds;
 
+		var config = Config.Load();
+		var ups = new UpsSensor(config.Ups);
+		sw.Restart(); ups.Read(r); var tUps = sw.Elapsed.TotalMilliseconds;
+
 		Console.WriteLine();
 		Console.WriteLine($"CPU      {Fmt(r.CpuLoad)} %      {Fmt(r.CpuTemp)} °C");
 		Console.WriteLine($"RAM      {Fmt(r.MemLoad)} %      {r.MemUsedGb.ToString("0.0", ci)} / {r.MemTotalGb.ToString("0.0", ci)} GB");
@@ -66,12 +70,17 @@ internal static class Program
 			Console.WriteLine($"volume   {v.Name,-4} R {v.ReadMb.ToString("0.00", ci).PadLeft(8)} / W {v.WriteMb.ToString("0.00", ci).PadLeft(8)} MB/s");
 		Console.WriteLine($"top io   {string.Join(", ", r.TopIo.Select(t => $"{t.Name} {t.Mb.ToString("0.0", ci)}"))}");
 		Console.WriteLine($"fan      {(r.GpuFanRpm.HasValue ? r.GpuFanRpm.Value.ToString("0", ci).PadLeft(4) + " rpm" : "   — rpm")}   {(r.GpuFanDuty.HasValue ? r.GpuFanDuty.Value.ToString("0", ci) + "%" : "—")}   GPU Fan");
+		if (ups.Present)
+			Console.WriteLine($"ups      {Fmt(r.UpsCharge)} %      {(r.UpsOnBattery ? "on battery" : "on line")}, " +
+							  $"{Fmt(r.UpsRunTimeMin)} min left, load {Fmt(r.UpsLoad)} %{(r.UpsNeedsNewBattery ? ", REPLACE BATTERY" : "")}");
+		else
+			Console.WriteLine($"ups      no answer over SNMP at {config.Ups.Host}:{config.Ups.Port} ({ups.LastError})");
 
 		Console.WriteLine();
 		Console.WriteLine($"counter in use: {perf.CounterInUse}");
 		Console.WriteLine($"sensor driver:  {(lhm.Available ? "loaded" : "UNAVAILABLE — " + (lhm.LastError ?? "run elevated"))}");
 		Console.WriteLine($"settings file:  {Config.Path}");
-		Console.WriteLine($"cost, ms:       perf(cpu+net+disk) {tCpu:0.0}  topio {tIo:0.0}  mem {tMem:0.0}  gpu {tGpu:0.0}  cputemp {tCpuTemp:0.0}  fans {tFans:0.0}  disktemp {tDisk:0.0}  raid {tRaid:0.0}");
+		Console.WriteLine($"cost, ms:       perf(cpu+net+disk) {tCpu:0.0}  topio {tIo:0.0}  mem {tMem:0.0}  gpu {tGpu:0.0}  cputemp {tCpuTemp:0.0}  fans {tFans:0.0}  disktemp {tDisk:0.0}  raid {tRaid:0.0}  ups {tUps:0.0}");
 		Console.WriteLine();
 		return 0;
 	}
@@ -96,6 +105,7 @@ internal sealed class TrayApp : ApplicationContext
 	private const int TopIoEveryTicks = 6;   // 12 s — the ~250-instance process query
 	private const int DiskEveryTicks = 30;   // 60 s
 	private const int RaidDiskEveryTicks = 300;  // 600 s — spawns smartctl.exe (~300 ms); HDD temperature drifts slowly
+	private const int UpsEveryTicks = 15;    // 30 s — a UDP round trip to the SNMP agent
 
 	// Built-in plate colours: one per metric family, so icons are told apart without reading them.
 	private static readonly Color CpuPlate = Color.FromArgb(28, 92, 168);      // blue
@@ -109,6 +119,7 @@ internal sealed class TrayApp : ApplicationContext
 	private static readonly Color NetPlate = Color.FromArgb(140, 60, 110);     // magenta
 	private static readonly Color VolumePlate = Color.FromArgb(92, 100, 40);   // olive
 	private static readonly Color RaidTempPlate = Color.FromArgb(150, 90, 30);  // amber
+	private static readonly Color UpsPlate = Color.FromArgb(128, 34, 60);      // maroon
 
 	// Per-icon identity for the tray. Windows keeps the position the user dragged an icon to
 	// against these values — never renumber them, or every icon jumps back to the end.
@@ -121,6 +132,7 @@ internal sealed class TrayApp : ApplicationContext
 	private static readonly Guid GpuTempGuid = new(GuidPrefix + "06");
 	private static readonly Guid GpuFanGuid = new(GuidPrefix + "07");
 	private static readonly Guid NetGuid = new(GuidPrefix + "08");
+	private static readonly Guid UpsGuid = new(GuidPrefix + "09");
 	private static readonly Guid[] RaidTempGuids =
 	{
 		new(GuidPrefix + "41"), new(GuidPrefix + "42"), new(GuidPrefix + "43"), new(GuidPrefix + "44"),
@@ -170,6 +182,7 @@ internal sealed class TrayApp : ApplicationContext
 	private readonly LhmSensor _lhm = new();
 	private readonly HddSensor _hdd = new();
 	private readonly Readings _r = new();
+	private readonly UpsSensor _ups;
 
 	private readonly ContextMenuStrip _menu = new();
 	private readonly System.Windows.Forms.Timer _timer;
@@ -181,10 +194,13 @@ internal sealed class TrayApp : ApplicationContext
 	private long _tick;
 	private bool _diskRefreshRunning;
 	private bool _raidRefreshRunning;
+	private bool _upsRefreshRunning;
 
 	public TrayApp()
 	{
+		_ups = new UpsSensor(_config.Ups);
 		Task.Run(RefreshDisks);   // first SMART query off the UI thread
+		Task.Run(RefreshUps);
 
 		_timer = new System.Windows.Forms.Timer { Interval = TickMs };
 		_timer.Tick += OnTick;
@@ -208,6 +224,7 @@ internal sealed class TrayApp : ApplicationContext
 		}
 		if (_tick % DiskEveryTicks == 0) Task.Run(RefreshDisks);
 		if (_tick % RaidDiskEveryTicks == 1) Task.Run(RefreshRaidDisk);
+		if (_tick % UpsEveryTicks == 2) Task.Run(RefreshUps);
 
 		var ci = CultureInfo.InvariantCulture;
 
@@ -238,6 +255,29 @@ internal sealed class TrayApp : ApplicationContext
 		ShowFans();
 		ShowNetwork();
 		ShowVolumes();
+		ShowUps();
+	}
+
+	/// <summary>
+	/// Charge of the UPS, once its SNMP agent has answered. Severity is inverted — a low charge
+	/// is what matters — and running on battery goes straight to red whatever the charge is,
+	/// because that is the state worth walking over to the rack for.
+	/// </summary>
+	private void ShowUps()
+	{
+		if (!_ups.Present) return;
+
+		var charge = _r.UpsCharge;
+		double? severity = charge.HasValue ? (_r.UpsOnBattery ? 100 : 100 - charge.Value) : null;
+		var power = _r.UpsOnBattery ? "от батареи" : "от сети";
+		var left = _r.UpsRunTimeMin.HasValue
+			? $"   ещё {_r.UpsRunTimeMin.Value.ToString("0", CultureInfo.InvariantCulture)} мин"
+			: "";
+		var load = _r.UpsLoad.HasValue ? $"   нагрузка {Pct(_r.UpsLoad)}" : "";
+		var replace = _r.UpsNeedsNewBattery ? "   ТРЕБУЕТ ЗАМЕНЫ" : "";
+
+		Show("ups", "UPS", UpsGuid, UpsPlate, 50, 75,
+			Whole(charge), severity, $"{Pct(charge)} {power}{left}{load}{replace}");
 	}
 
 	/// <summary>Traffic over physical adapters; virtual switch chatter between VMs is not counted.</summary>
@@ -300,6 +340,14 @@ internal sealed class TrayApp : ApplicationContext
 		finally { _raidRefreshRunning = false; }
 	}
 
+	private void RefreshUps()
+	{
+		if (_upsRefreshRunning) return;
+		_upsRefreshRunning = true;
+		try { _ups.Read(_r); }
+		finally { _upsRefreshRunning = false; }
+	}
+
 	/// <summary>
 	/// One icon per fan that was turning at startup, plus the GPU fan. A stopped fan reads 0
 	/// and goes red — that is the state worth noticing, so severity is inverted here.
@@ -359,6 +407,7 @@ internal sealed class TrayApp : ApplicationContext
 
 		slot.Icon ??= new TrayValueIcon(OnIconRightClick, PlateOf(slot), slot.Guid, WarnOf(slot), CritOf(slot));
 		slot.Icon.SetThresholds(WarnOf(slot), CritOf(slot));
+		slot.Icon.SetInk(InkOf(slot));
 		slot.Icon.Update(text, severity, $"{LabelOf(slot)}   {detail}");
 	}
 
@@ -382,6 +431,14 @@ internal sealed class TrayApp : ApplicationContext
 
 	private string LabelOf(IconSlot slot) => _config.For(slot.Id).Label ?? slot.DefaultLabel;
 
+	/// <summary>Digit colour chosen by the user; null lets the icon pick it by the plate colour.</summary>
+	private Color? InkOf(IconSlot slot) => _config.For(slot.Id).Ink switch
+	{
+		"light" => Color.White,
+		"dark" => Color.Black,
+		_ => null,
+	};
+
 	// ---- tray menu ----
 
 	private void OnIconRightClick(TrayValueIcon icon)
@@ -394,6 +451,7 @@ internal sealed class TrayApp : ApplicationContext
 			_menu.Items.Add(new ToolStripMenuItem(LabelOf(clicked)) { Enabled = false });
 			_menu.Items.Add(new ToolStripSeparator());
 			_menu.Items.Add("Цвет фона…", null, (_, _) => PickColor(clicked));
+			_menu.Items.Add(InkMenu(clicked));
 			_menu.Items.Add("Переименовать…", null, (_, _) => Rename(clicked));
 			var alerts = new ToolStripMenuItem("Подсвечивать при перегрузке")
 			{
@@ -433,6 +491,31 @@ internal sealed class TrayApp : ApplicationContext
 
 		icon.PrepareMenu();
 		_menu.Show(Cursor.Position);
+	}
+
+	/// <summary>
+	/// Light or dark digits for this icon. "Авто" is the built-in rule — dark on the yellow
+	/// warning plate, light everywhere else — which only fits plates that are dark themselves.
+	/// </summary>
+	private ToolStripMenuItem InkMenu(IconSlot slot)
+	{
+		var menu = new ToolStripMenuItem("Цвет цифр");
+		var current = _config.For(slot.Id).Ink;
+		foreach (var (label, value) in new[] { ("Авто", (string)null), ("Светлые", "light"), ("Тёмные", "dark") })
+		{
+			var choice = value;
+			var item = new ToolStripMenuItem(label) { Checked = current == choice };
+			item.Click += (_, _) => SetInk(slot, choice);
+			menu.DropDownItems.Add(item);
+		}
+		return menu;
+	}
+
+	private void SetInk(IconSlot slot, string ink)
+	{
+		_config.For(slot.Id).Ink = ink;
+		_config.Save();
+		slot.Icon?.SetInk(InkOf(slot));
 	}
 
 	private void PickColor(IconSlot slot)

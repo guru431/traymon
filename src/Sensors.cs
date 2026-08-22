@@ -22,6 +22,12 @@ public sealed class Readings
 	public List<(string Name, double Temp, string Serial)> RaidDisks = new();   // disks behind a RAID controller
 	public List<(string Name, double Rpm, double? Duty)> Fans = new();
 
+	public double? UpsCharge;      // % of battery capacity
+	public double? UpsRunTimeMin;  // minutes left on battery
+	public double? UpsLoad;        // % of the rated load of the UPS
+	public bool UpsOnBattery;
+	public bool UpsNeedsNewBattery;
+
 	public double NetInMb;         // MB/s over physical adapters
 	public double NetOutMb;
 	public double NetLinkMb;       // link speed of the fastest physical adapter, MB/s

@@ -66,6 +66,7 @@ public sealed class TrayValueIcon : IDisposable
 	private double _crit;
 	private Color _plate;
 
+	private Color? _ink;
 	private bool _useGuid = true;
 	private bool _added;
 	private string _lastText;
@@ -98,6 +99,18 @@ public sealed class TrayValueIcon : IDisposable
 	{
 		if (_plate == plate) return;
 		_plate = plate;
+		_lastText = null;   // force a repaint
+		Update(_lastDrawn, _lastSeverity, _lastTip);
+	}
+
+	/// <summary>
+	/// Forces the colour of the digits, or restores the automatic choice when given null.
+	/// Repaints immediately.
+	/// </summary>
+	public void SetInk(Color? ink)
+	{
+		if (_ink == ink) return;
+		_ink = ink;
 		_lastText = null;   // force a repaint
 		Update(_lastDrawn, _lastSeverity, _lastTip);
 	}
@@ -135,7 +148,7 @@ public sealed class TrayValueIcon : IDisposable
 		if (redraw)
 		{
 			var previous = _iconHandle;
-			_iconHandle = Render(text, color);
+			_iconHandle = Render(text, color, _ink);
 			if (previous != IntPtr.Zero) DestroyIcon(previous);
 		}
 
@@ -191,7 +204,8 @@ public sealed class TrayValueIcon : IDisposable
 	/// <summary>Brings the hidden window forward so the menu closes when focus is lost.</summary>
 	public void PrepareMenu() => SetForegroundWindow(_window.Handle);
 
-	private static IntPtr Render(string text, Color plate)
+	/// <param name="forcedInk">Colour of the digits chosen by the user; null picks it by the plate.</param>
+	private static IntPtr Render(string text, Color plate, Color? forcedInk)
 	{
 		// Draw at the size Windows actually asks for, so nothing is rescaled on high-DPI screens.
 		var side = Math.Max(16, SystemInformation.SmallIconSize.Height);
@@ -205,7 +219,7 @@ public sealed class TrayValueIcon : IDisposable
 				g.FillPath(back, path);
 
 			// Yellow plate is too bright for white digits.
-			var ink = plate == WarnPlate ? Color.Black : Color.White;
+			var ink = forcedInk ?? (plate == WarnPlate ? Color.Black : Color.White);
 
 			g.SmoothingMode = SmoothingMode.None;
 			g.TextRenderingHint = TextRenderingHint.SingleBitPerPixelGridFit;
