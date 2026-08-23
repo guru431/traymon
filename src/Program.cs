@@ -65,7 +65,11 @@ internal static class Program
 			Console.WriteLine($"raid     {d.Temp.ToString("0", ci)} °C     {d.Name} {d.Serial}   (behind RAID controller)");
 		foreach (var f in r.Fans)
 			Console.WriteLine($"fan      {f.Rpm.ToString("0", ci).PadLeft(4)} rpm   {(f.Duty.HasValue ? f.Duty.Value.ToString("0", ci) + "%" : "—")}   {f.Name}{(f.Rpm == 0 ? "   (header empty)" : "")}");
-		Console.WriteLine($"net      ↓ {r.NetInMb.ToString("0.00", ci)} / ↑ {r.NetOutMb.ToString("0.00", ci)} MB/s   link {r.NetLinkMb.ToString("0", ci)} MB/s");
+		foreach (var n in r.Nets)
+			Console.WriteLine($"net      ↓ {(n.InMb * 8).ToString("0.00", ci)} / ↑ {(n.OutMb * 8).ToString("0.00", ci)} Mbit/s   " +
+							  $"link {(n.LinkMb * 8).ToString("0", ci)} Mbit/s   {n.Name}");
+		if (r.Nets.Count == 0)
+			Console.WriteLine("net      no physical adapter with a link");
 		foreach (var v in r.Volumes)
 			Console.WriteLine($"volume   {v.Name,-4} R {v.ReadMb.ToString("0.00", ci).PadLeft(8)} / W {v.WriteMb.ToString("0.00", ci).PadLeft(8)} MB/s");
 		Console.WriteLine($"top io   {string.Join(", ", r.TopIo.Select(t => $"{t.Name} {t.Mb.ToString("0.0", ci)}"))}");
@@ -108,18 +112,19 @@ internal sealed class TrayApp : ApplicationContext
 	private const int UpsEveryTicks = 15;    // 30 s — a UDP round trip to the SNMP agent
 
 	// Built-in plate colours: one per metric family, so icons are told apart without reading them.
-	private static readonly Color CpuPlate = Color.FromArgb(28, 92, 168);      // blue
-	private static readonly Color RamPlate = Color.FromArgb(34, 120, 62);      // green
-	private static readonly Color GpuPlate = Color.FromArgb(0, 116, 122);      // teal
-	private static readonly Color VramPlate = Color.FromArgb(104, 58, 154);    // violet
-	private static readonly Color CpuTempPlate = Color.FromArgb(80, 80, 92);   // steel
-	private static readonly Color GpuTempPlate = Color.FromArgb(86, 62, 120);  // dark violet
-	private static readonly Color DiskTempPlate = Color.FromArgb(122, 76, 30); // brown
-	private static readonly Color FanPlate = Color.FromArgb(58, 74, 104);      // slate
-	private static readonly Color NetPlate = Color.FromArgb(140, 60, 110);     // magenta
-	private static readonly Color VolumePlate = Color.FromArgb(92, 100, 40);   // olive
-	private static readonly Color RaidTempPlate = Color.FromArgb(150, 90, 30);  // amber
-	private static readonly Color UpsPlate = Color.FromArgb(128, 34, 60);      // maroon
+	// Temperatures share a colour with the device they belong to, and RAID disks with NVMe ones.
+	private static readonly Color CpuPlate = Color.FromArgb(128, 0, 255);      // violet
+	private static readonly Color RamPlate = Color.FromArgb(64, 128, 128);     // teal
+	private static readonly Color GpuPlate = Color.FromArgb(128, 0, 0);        // maroon
+	private static readonly Color VramPlate = Color.FromArgb(0, 128, 0);       // green
+	private static readonly Color CpuTempPlate = Color.FromArgb(128, 0, 0);    // maroon
+	private static readonly Color GpuTempPlate = Color.FromArgb(0, 0, 255);    // blue
+	private static readonly Color DiskTempPlate = Color.FromArgb(255, 128, 0); // orange
+	private static readonly Color FanPlate = Color.FromArgb(255, 0, 255);      // magenta
+	private static readonly Color NetPlate = Color.FromArgb(0, 128, 192);      // azure
+	private static readonly Color VolumePlate = Color.FromArgb(128, 64, 0);    // brown
+	private static readonly Color RaidTempPlate = Color.FromArgb(255, 128, 0); // orange
+	private static readonly Color UpsPlate = Color.FromArgb(128, 128, 128);    // grey
 
 	// Per-icon identity for the tray. Windows keeps the position the user dragged an icon to
 	// against these values — never renumber them, or every icon jumps back to the end.
@@ -131,8 +136,14 @@ internal sealed class TrayApp : ApplicationContext
 	private static readonly Guid CpuTempGuid = new(GuidPrefix + "05");
 	private static readonly Guid GpuTempGuid = new(GuidPrefix + "06");
 	private static readonly Guid GpuFanGuid = new(GuidPrefix + "07");
-	private static readonly Guid NetGuid = new(GuidPrefix + "08");
 	private static readonly Guid UpsGuid = new(GuidPrefix + "09");
+	// The first slot reuses the GUID of the single "NET" icon this used to be, so on a machine
+	// with one adapter the icon keeps the place in the tray the user dragged it to.
+	private static readonly Guid[] NetGuids =
+	{
+		new(GuidPrefix + "08"), new(GuidPrefix + "51"), new(GuidPrefix + "52"), new(GuidPrefix + "53"),
+		new(GuidPrefix + "54"), new(GuidPrefix + "55"), new(GuidPrefix + "56"), new(GuidPrefix + "57"),
+	};
 	private static readonly Guid[] RaidTempGuids =
 	{
 		new(GuidPrefix + "41"), new(GuidPrefix + "42"), new(GuidPrefix + "43"), new(GuidPrefix + "44"),
@@ -190,6 +201,9 @@ internal sealed class TrayApp : ApplicationContext
 	/// <summary>Fans that were spinning at startup. Headers with nothing plugged in stay hidden,
 	/// but a fan that stops later keeps its icon and turns red.</summary>
 	private List<string> _fanNames;
+
+	/// <summary>Tray slot taken by each network adapter, see <see cref="NetGuidFor"/>.</summary>
+	private readonly Dictionary<string, Guid> _netGuids = new();
 
 	private long _tick;
 	private bool _diskRefreshRunning;
@@ -280,15 +294,39 @@ internal sealed class TrayApp : ApplicationContext
 			Whole(charge), severity, $"{Pct(charge)} {power}{left}{load}{replace}");
 	}
 
-	/// <summary>Traffic over physical adapters; virtual switch chatter between VMs is not counted.</summary>
+	/// <summary>
+	/// One icon per physical adapter, received plus sent; virtual switch chatter between VMs is
+	/// not counted. An adapter with no link and no traffic — an empty Ethernet socket next to the
+	/// Wi-Fi actually in use — gets no icon at all.
+	/// </summary>
 	private void ShowNetwork()
 	{
-		var total = _r.NetInMb + _r.NetOutMb;
-		var link = _r.NetLinkMb;
-		var utilisation = link > 0 ? 100 * total / link : 0;
-		var of = link > 0 ? $"   {utilisation:0}% of {link:0} MB/s" : "";
-		Show("net", "NET", NetGuid, NetPlate, 70, 90, Mb(total), utilisation,
-			$"↓ {Mb2(_r.NetInMb)} / ↑ {Mb2(_r.NetOutMb)} MB/s{of}");
+		foreach (var n in _r.Nets)
+		{
+			var guid = NetGuidFor(n.Name);
+			if (guid is null) break;   // more adapters than prepared slots
+
+			var total = n.InMb + n.OutMb;
+			var utilisation = n.LinkMb > 0 ? 100 * total / n.LinkMb : 0;
+			var of = n.LinkMb > 0 ? $"   {utilisation:0}% от {n.LinkMb * 8:0} Мбит/с" : "";
+			Show($"net.{n.Name}", n.Name, guid.Value, NetPlate, 70, 90, MbitWhole(total), utilisation,
+				$"↓ {Mbit(n.InMb)} / ↑ {Mbit(n.OutMb)} Мбит/с   ({Mb2(n.InMb)} / {Mb2(n.OutMb)} МБ/с){of}");
+		}
+	}
+
+	/// <summary>
+	/// A GUID per adapter name, never handed out twice: adapters come and go while the machine
+	/// runs (cable plugged in, VPN raised), and two icons registered under one GUID would fight
+	/// over the same slot in the tray — the second one silently unregisters the first.
+	/// </summary>
+	private Guid? NetGuidFor(string name)
+	{
+		if (_netGuids.TryGetValue(name, out var known)) return known;
+
+		var free = NetGuids.FirstOrDefault(g => !_netGuids.ContainsValue(g));
+		if (free == Guid.Empty) return null;
+		_netGuids[name] = free;
+		return free;
 	}
 
 	/// <summary>One icon per lettered volume, showing read plus write.</summary>
@@ -650,6 +688,20 @@ internal sealed class TrayApp : ApplicationContext
 
 	/// <summary>MB/s for a tooltip, always with one decimal.</summary>
 	private static string Mb2(double v) => v.ToString("0.0", CultureInfo.InvariantCulture);
+
+	/// <summary>
+	/// Network icons count in megabits, not megabytes — and whole ones, like every other icon.
+	/// Megabits are the unit a link is rated in (this Wi-Fi links at 1200 Mbit/s) and the only
+	/// one in which an ordinary working day is visible at all: background chatter of 30 KB/s is
+	/// 0 MB/s however many decimals are drawn, but 1 Mbit/s. Decimals stay out of it for the
+	/// reason they are out of the rest — a changed digit costs a repaint and a call into the shell.
+	/// </summary>
+	private static string MbitWhole(double megabytesPerSecond) =>
+		Math.Round(megabytesPerSecond * 8, 0).ToString("0", CultureInfo.InvariantCulture);
+
+	/// <summary>Mbit/s for a tooltip, always with one decimal.</summary>
+	private static string Mbit(double megabytesPerSecond) =>
+		(megabytesPerSecond * 8).ToString("0.0", CultureInfo.InvariantCulture);
 
 	/// <summary>
 	/// Fan speed in thousands: 586 rpm shows as 0.6, 1240 as 1.2. Four digits do not fit into

@@ -181,20 +181,24 @@ public sealed class PerfSensors : IDisposable
 		if (!includeIo) return;
 
 		const double mb = 1024.0 * 1024;
-		var inBytes = SumPhysical(_query.ReadArray(_netIn));
-		var outBytes = SumPhysical(_query.ReadArray(_netOut));
-		r.NetInMb = inBytes / mb;
-		r.NetOutMb = outBytes / mb;
 
 		// Link speed comes from the same counters as the traffic: on a Hyper-V host the physical
 		// NIC belongs to the external switch and does not appear among .NET network interfaces
 		// at all — only "vEthernet (...)" does.
-		var bandwidths = _query.ReadArray(_netBandwidth)
-			.Where(x => !NotPhysical.Any(bad => x.Instance.Contains(bad, StringComparison.OrdinalIgnoreCase)))
-			.Select(x => x.Value)
-			.Where(v => v > 0)
+		var sent = _query.ReadArray(_netOut);
+		var bandwidth = _query.ReadArray(_netBandwidth);
+		r.Nets = _query.ReadArray(_netIn)
+			.Where(x => IsPhysical(x.Instance))
+			.Select(x => (
+				Name: x.Instance,
+				InMb: x.Value / mb,
+				OutMb: sent.FirstOrDefault(o => o.Instance == x.Instance).Value / mb,
+				LinkMb: bandwidth.FirstOrDefault(b => b.Instance == x.Instance).Value / 8 / mb))
+			// An unplugged adapter reports zero bandwidth; one that carries traffic is kept even
+			// then, so a driver that does not fill Current Bandwidth in cannot hide its icon.
+			.Where(n => n.LinkMb > 0 || n.InMb > 0 || n.OutMb > 0)
+			.OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase)
 			.ToList();
-		r.NetLinkMb = bandwidths.Count == 0 ? 0 : bandwidths.Max() / 8 / mb;
 
 		var reads = _query.ReadArray(_diskRead);
 		var writes = _query.ReadArray(_diskWrite);
@@ -224,9 +228,8 @@ public sealed class PerfSensors : IDisposable
 			.ToList();
 	}
 
-	private static double SumPhysical(List<(string Instance, double Value)> rows) =>
-		rows.Where(x => !NotPhysical.Any(bad => x.Instance.Contains(bad, StringComparison.OrdinalIgnoreCase)))
-			.Sum(x => x.Value);
+	private static bool IsPhysical(string instance) =>
+		!NotPhysical.Any(bad => instance.Contains(bad, StringComparison.OrdinalIgnoreCase));
 
 	/// <summary>Keeps lettered volumes: "_Total" and "HarddiskVolume5" are not interesting here.</summary>
 	private static bool IsVolume(string instance) =>

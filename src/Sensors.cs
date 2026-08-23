@@ -28,9 +28,8 @@ public sealed class Readings
 	public bool UpsOnBattery;
 	public bool UpsNeedsNewBattery;
 
-	public double NetInMb;         // MB/s over physical adapters
-	public double NetOutMb;
-	public double NetLinkMb;       // link speed of the fastest physical adapter, MB/s
+	// One entry per physical adapter that is up: throughput in MB/s and its link speed.
+	public List<(string Name, double InMb, double OutMb, double LinkMb)> Nets = new();
 	public List<(string Name, double ReadMb, double WriteMb)> Volumes = new();
 	public List<(string Name, double Mb)> TopIo = new();
 }
