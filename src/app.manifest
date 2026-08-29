@@ -5,9 +5,11 @@
   <!-- Reading CPU package temperature goes through an MSR driver, which needs an elevated token.
        Started from Task Scheduler with RunLevel HighestAvailable, so no UAC prompt appears.
        ("Highest" is not a value the Task Scheduler schema accepts — only LeastPrivilege and
-       HighestAvailable are.) Consequence worth remembering: --once cannot start from an
-       ordinary console either. Run it from an elevated one, or through the runtime
-       (dotnet TrayMon.dll --once) to see the unelevated behaviour. -->
+       HighestAvailable are.) Consequence worth remembering: the one-shot switch cannot start
+       the exe from an ordinary console either. Run it from an elevated one, or through the
+       runtime (dotnet TrayMon.dll) to see the unelevated behaviour.
+       Never spell that switch out inside this comment: a double hyphen is illegal in XML
+       comments, the manifest stops parsing, and every start dies with 0x800736B1 (SxS). -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
