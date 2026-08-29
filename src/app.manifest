@@ -3,7 +3,11 @@
   <assemblyIdentity version="1.0.0.0" name="TrayMon.app" />
 
   <!-- Reading CPU package temperature goes through an MSR driver, which needs an elevated token.
-       Started from Task Scheduler with RunLevel Highest, so no UAC prompt appears. -->
+       Started from Task Scheduler with RunLevel HighestAvailable, so no UAC prompt appears.
+       ("Highest" is not a value the Task Scheduler schema accepts — only LeastPrivilege and
+       HighestAvailable are.) Consequence worth remembering: --once cannot start from an
+       ordinary console either. Run it from an elevated one, or through the runtime
+       (dotnet TrayMon.dll --once) to see the unelevated behaviour. -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">

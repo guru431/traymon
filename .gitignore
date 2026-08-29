@@ -11,5 +11,7 @@ out/
 
 # runtime files, not part of the source
 TrayMon.json
+TrayMon.json.bad
+TrayMon.csv
 smartctl.exe
 drivedb.h
