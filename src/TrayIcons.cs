@@ -126,6 +126,9 @@ public sealed class TrayValueIcon : IDisposable
 	private Color? _ink;
 	private bool _useGuid = true;
 	private bool _added;
+	/// <summary>Whether the shell accepted the version-4 protocol, which decides which of the two
+	/// messages it sends per click is the one to act on. See <see cref="OnTrayMessage"/>.</summary>
+	private bool _version4;
 	private string _lastText;
 	private string _lastTip = "";
 	private string _lastDrawn;
@@ -315,7 +318,7 @@ public sealed class TrayValueIcon : IDisposable
 	{
 		var version = NewData();
 		version.uVersion = NOTIFYICON_VERSION_4;
-		Shell_NotifyIcon(NIM_SETVERSION, ref version);
+		_version4 = Shell_NotifyIcon(NIM_SETVERSION, ref version);
 	}
 
 	private NotifyIconData NewData() => new()
@@ -340,13 +343,23 @@ public sealed class TrayValueIcon : IDisposable
 		switch (notification)
 		{
 			case WM_CONTEXTMENU:
-			case WM_RBUTTONUP:
 				_onRightClick?.Invoke(this);
 				break;
 			case NIN_SELECT:
 			case NIN_KEYSELECT:
-			case WM_LBUTTONUP:
 				_onLeftClick?.Invoke(this);
+				break;
+			// Version 4 delivers the raw button messages *as well as* the gesture ones: one right
+			// click measured as WM_RBUTTONDOWN, WM_RBUTTONUP and then WM_CONTEXTMENU 125 ms later,
+			// one left click as WM_LBUTTONDOWN, WM_LBUTTONUP and NIN_SELECT. Acting on both built
+			// and showed the menu twice for one click, which left two menus on the screen. The
+			// gesture message is the one to keep — it is also what the keyboard sends — but only
+			// once the shell has accepted the version, because version 0 never sends it.
+			case WM_RBUTTONUP:
+				if (!_version4) _onRightClick?.Invoke(this);
+				break;
+			case WM_LBUTTONUP:
+				if (!_version4) _onLeftClick?.Invoke(this);
 				break;
 			case WM_MOUSEMOVE:
 			case NIN_POPUPOPEN:

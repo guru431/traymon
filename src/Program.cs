@@ -453,6 +453,10 @@ internal sealed class TrayApp : ApplicationContext
 	private readonly UpsSensor _ups;
 
 	private readonly ContextMenuStrip _menu = new();
+
+	/// <summary>True while the "Показывать значки" list is open, which is when a click on an item
+	/// must not close the menu. See the handler in the constructor.</summary>
+	private bool _pickingIcons;
 	private readonly System.Windows.Forms.Timer _timer;
 	private readonly bool _dry;
 
@@ -534,6 +538,15 @@ internal sealed class TrayApp : ApplicationContext
 			("вентиляторы", ShowFans), ("сеть", ShowNetwork), ("тома", ShowVolumes),
 			("свободное место", ShowFreeSpace), ("ИБП", ShowUps), ("время работы", ShowUptime),
 			("сводный значок", ShowWorst),
+		};
+
+		// A click on any menu item closes the whole chain, submenu included, so ticking five icons
+		// in the list meant reopening the menu five times. The close is cancelled while that list
+		// is the thing being used — and only then: every other item here is a command, and a
+		// command that leaves its menu on the screen is worse than the reopening was.
+		_menu.Closing += (_, e) =>
+		{
+			if (_pickingIcons && e.CloseReason == ToolStripDropDownCloseReason.ItemClicked) e.Cancel = true;
 		};
 
 		if (_dry) return;
@@ -1127,7 +1140,7 @@ internal sealed class TrayApp : ApplicationContext
 		// is visible — and the menu lives on the icons, so there is then no way to find the
 		// program at all. Start with the four that answer "is this machine busy", and let the
 		// rest be switched on from the menu. Existing installations are untouched: they have a
-		// settings file already.
+		// settings file already, so this only takes effect on a machine with no TrayMon.json.
 		if (_firstRun && !DefaultOn(slot.Id))
 		{
 			_config.For(slot.Id).Enabled = false;
@@ -1138,8 +1151,10 @@ internal sealed class TrayApp : ApplicationContext
 		_order.Add(slot);
 	}
 
-	private static bool DefaultOn(string id) =>
-		id is "cpu" or "ram" or "cpu.temp" || id.StartsWith("net.", StringComparison.Ordinal);
+	/// <summary>The four load meters, and only for the first card: every adapter, every volume and
+	/// every second card would put the count back where it was. "gpu.0" is the load of card 0 —
+	/// its temperature is "gpu.temp.0" and stays off.</summary>
+	private static bool DefaultOn(string id) => id is "cpu" or "ram" or "gpu.0" or "vram.0";
 
 	/// <summary>
 	/// Feeds the five-minute window behind the tooltip and marks the slot alive.
@@ -1378,6 +1393,9 @@ internal sealed class TrayApp : ApplicationContext
 	{
 		var clicked = _order.FirstOrDefault(s => ReferenceEquals(s.Icon, icon));
 
+		// A right-click on another icon does not close the menu that is already up, and the items
+		// about to be thrown away are the ones it is showing.
+		if (_menu.Visible) _menu.Close();
 		ClearMenu();
 		if (clicked is not null)
 		{
@@ -1431,6 +1449,7 @@ internal sealed class TrayApp : ApplicationContext
 	/// and an opened submenu has a window handle no finaliser destroys.</summary>
 	private void ClearMenu()
 	{
+		_pickingIcons = false;   // the item that would have said so is about to be disposed
 		var items = _menu.Items.Cast<ToolStripItem>().ToArray();
 		_menu.Items.Clear();
 		foreach (var item in items) item.Dispose();
@@ -1444,6 +1463,14 @@ internal sealed class TrayApp : ApplicationContext
 	private ToolStripMenuItem VisibilityMenu()
 	{
 		var all = new ToolStripMenuItem("Показывать значки");
+		all.DropDownOpened += (_, _) => _pickingIcons = true;
+		all.DropDownClosed += (_, _) => _pickingIcons = false;
+		// The chain closes from the top down, so the parent has to be held open too — that half
+		// is the handler on _menu in the constructor.
+		all.DropDown.Closing += (_, e) =>
+		{
+			if (e.CloseReason == ToolStripDropDownCloseReason.ItemClicked) e.Cancel = true;
+		};
 		foreach (var group in Groups)
 		{
 			var members = _order
@@ -1463,7 +1490,10 @@ internal sealed class TrayApp : ApplicationContext
 					CheckOnClick = true,
 				};
 				var captured = slot;
-				item.Click += (_, _) => SetEnabled(captured, item.Checked);
+				// The tick is put there by CheckOnClick before anything is asked of us, so a
+				// refusal has to take it back — the list stays open now, and a tick next to an
+				// icon that is not there is a lie the user goes on looking at.
+				item.Click += (_, _) => { if (!SetEnabled(captured, item.Checked)) item.Checked = !item.Checked; };
 				all.DropDownItems.Add(item);
 			}
 		}
@@ -1580,14 +1610,15 @@ internal sealed class TrayApp : ApplicationContext
 		slot.Icon?.Update(slot.LastText, slot.LastSeverity, $"{LabelOf(slot)}   {slot.LastDetail}");
 	}
 
-	private void SetEnabled(IconSlot slot, bool enabled)
+	/// <returns>False when the change was refused, so the caller can put its tick back.</returns>
+	private bool SetEnabled(IconSlot slot, bool enabled)
 	{
 		// The menu lives on the icons; hiding the last one would leave no way back in — not
 		// even to quit. Slots that went grey do not count: they have no icon to right-click.
 		if (!enabled && _order.Count(s => s.Settings.Enabled && !s.Dead) <= 1)
 		{
 			Info("Последний значок скрыть нельзя — иначе не останется меню.");
-			return;
+			return false;
 		}
 
 		Own(slot).Enabled = enabled;
@@ -1595,7 +1626,7 @@ internal sealed class TrayApp : ApplicationContext
 		if (!enabled)
 		{
 			if (slot.Icon is not null) { slot.Icon.Dispose(); slot.Icon = null; }
-			return;
+			return true;
 		}
 		// The user's thresholds and ink, not the built-in ones: creating the icon with
 		// slot.Metric.Warn made a freshly unhidden icon flash yellow for a tick even with the
@@ -1604,6 +1635,7 @@ internal sealed class TrayApp : ApplicationContext
 			WarnOf(slot), CritOf(slot));
 		slot.Icon.SetInk(InkOf(slot));
 		slot.Icon.Update(slot.LastText, slot.LastSeverity, $"{LabelOf(slot)}   {slot.LastDetail}");
+		return true;
 	}
 
 	/// <summary>
