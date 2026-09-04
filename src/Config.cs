@@ -24,13 +24,26 @@ public sealed class IconSettings
 	/// <summary>Colour of the digits: "light", "dark", or null to pick by the plate colour.</summary>
 	public string Ink { get; set; }
 
-	/// <summary>Value at which the plate turns yellow; null keeps the built-in threshold.
-	/// Set both this and <see cref="Crit"/> above any reachable value to switch the
-	/// threshold colouring off and always see the chosen plate colour.</summary>
+	/// <summary>Value at which the plate turns yellow; null keeps the built-in threshold.</summary>
 	public double? Warn { get; set; }
 
 	/// <summary>Value at which the plate turns red; null keeps the built-in threshold.</summary>
 	public double? Crit { get; set; }
+
+	/// <summary>
+	/// False switches threshold colouring off for this icon — the plate then always shows its
+	/// own colour. A flag rather than a pair of unreachable thresholds: writing 1e9 into Warn
+	/// and Crit destroyed whatever the user had set, and the file is meant to be read by people.
+	/// Null means "on", so the entry only appears once somebody turns it off.
+	/// </summary>
+	public bool? Alerts { get; set; }
+
+	/// <summary>
+	/// Whether a transition into the red raises a balloon. Null means the built-in choice for
+	/// that metric — on for the three that mean hardware is failing (a RAID disk, a stopped fan,
+	/// free space), off for everything else.
+	/// </summary>
+	public bool? NotifyOnCritical { get; set; }
 }
 
 /// <summary>
@@ -91,11 +104,19 @@ public sealed class NetSettings
 
 	private List<string> _notPhysical;
 
-	/// <summary>Substrings that mark an adapter as virtual; null keeps the built-in list.</summary>
+	/// <summary>
+	/// Substrings that mark an adapter as virtual; null keeps the built-in list. Empty and null
+	/// entries are dropped: <c>[""]</c> matches every description and used to hide every adapter,
+	/// and a literal <c>null</c> in the list threw once every six seconds inside the network family.
+	/// </summary>
 	public List<string> NotPhysical
 	{
 		get => _notPhysical;
-		set { if (value is { Count: > 0 }) _notPhysical = value; }
+		set
+		{
+			var clean = value?.Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
+			if (clean is { Count: > 0 }) _notPhysical = clean;
+		}
 	}
 
 	[JsonIgnore]
@@ -106,8 +127,23 @@ public sealed class NetSettings
 public sealed class ToolSettings
 {
 	/// <summary>Full path to smartctl.exe. README calls it an optional external tool, so where
-	/// it lives should not be hard-wired to the install folder.</summary>
+	/// it lives should not be hard-wired to the install folder. A relative value is resolved
+	/// against the program folder, never against the working directory: under the logon task
+	/// that directory is %SystemRoot%\System32, and this process holds an elevated token.</summary>
 	public string Smartctl { get; set; }
+
+	private string _smartctlScan = "--scan-open -d csmi";
+
+	/// <summary>
+	/// How to enumerate the disks behind the controller. CSMI covers Intel RST, which is what
+	/// this was written for, but LSI and Adaptec want <c>-d megaraid,N</c> or <c>-d aacraid,...</c>
+	/// — and that cannot be guessed, so it is a setting rather than a constant.
+	/// </summary>
+	public string SmartctlScan
+	{
+		get => _smartctlScan;
+		set { if (!string.IsNullOrWhiteSpace(value)) _smartctlScan = value; }
+	}
 }
 
 /// <summary>
@@ -139,11 +175,32 @@ public sealed class LogSettings
 /// </summary>
 public sealed class Config
 {
+	// Lenient on the way in, strict on the way out. This file is one the README invites people
+	// to edit by hand, and the strict defaults silently dropped whatever did not match exactly:
+	// a lower-case "warn" was ignored and then erased by the next Save, and a trailing comma or
+	// a // comment threw the whole file out and renamed it to .bad.
 	private static readonly JsonSerializerOptions JsonOptions = new()
 	{
 		WriteIndented = true,
 		DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+		PropertyNameCaseInsensitive = true,
+		ReadCommentHandling = JsonCommentHandling.Skip,
+		AllowTrailingCommas = true,
 	};
+
+	private int _tickMs = 2000;
+
+	/// <summary>
+	/// How often everything is polled. Only upwards: the price of this program is proportional
+	/// to this number, and letting it be lowered would turn the one measurement the project is
+	/// built on into whatever the file happens to say. 2 s is the built-in rate; 5 or 10 s is
+	/// for machines where even 0.5 % of a core is worth arguing about.
+	/// </summary>
+	public int TickMs
+	{
+		get => _tickMs;
+		set { if (value is >= 2000 and <= 60000) _tickMs = value; }
+	}
 
 	public Dictionary<string, IconSettings> Icons { get; set; } = new();
 
@@ -198,13 +255,20 @@ public sealed class Config
 				return config;
 			}
 		}
-		catch (Exception ex)
+		catch (JsonException ex)
 		{
 			// A broken file must not keep the program from starting — but it must not be thrown
 			// away in silence either: the first change from the menu would overwrite hand-made
 			// colours, labels and the UPS address with defaults, with nothing said about it.
-			var spoiled = new Config { LoadError = Keep(ex) };
-			return spoiled;
+			return new Config { LoadError = Keep(ex) };
+		}
+		catch (Exception ex)
+		{
+			// Everything that is not "the JSON is wrong" is transient: the file open in an editor,
+			// an antivirus or OneDrive holding it for a moment. Renaming a perfectly good file to
+			// .bad because a read collided with a scanner is how settings disappear for good —
+			// the second such collision deleted the previous .bad on the way past.
+			return new Config { LoadError = ex.GetType().Name + ": " + ex.Message + " — файл не тронут, настройки взяты по умолчанию" };
 		}
 		return new Config();
 	}
@@ -232,6 +296,10 @@ public sealed class Config
 	/// Writes through a temporary file: this program runs on machines that lose power (that is
 	/// what the UPS icon is for), and WriteAllText truncates before it writes, so a cut at the
 	/// wrong moment used to leave half a JSON file and lose every setting.
+	///
+	/// The temporary file is flushed all the way to the device before the rename. NTFS journals
+	/// metadata, so the rename can reach the disk while the bytes it points at are still in the
+	/// cache — which is the same half-written file the temporary was there to prevent.
 	/// </summary>
 	public bool Save(out string error)
 	{
@@ -239,7 +307,13 @@ public sealed class Config
 		var temp = Path + ".tmp";
 		try
 		{
-			File.WriteAllText(temp, JsonSerializer.Serialize(this, JsonOptions));
+			var bytes = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(this, JsonOptions));
+			using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None,
+											   4096, FileOptions.WriteThrough))
+			{
+				stream.Write(bytes, 0, bytes.Length);
+				stream.Flush(flushToDisk: true);
+			}
 			if (File.Exists(Path)) File.Replace(temp, Path, null);
 			else File.Move(temp, Path);
 			Stamp = File.GetLastWriteTimeUtc(Path);
@@ -267,7 +341,8 @@ public sealed class Config
 	public void Tidy(string id)
 	{
 		if (!Icons.TryGetValue(id, out var s)) return;
-		if (s.Enabled && s.Color is null && s.Label is null && s.Ink is null && s.Warn is null && s.Crit is null)
+		if (s.Enabled && s.Color is null && s.Label is null && s.Ink is null && s.Warn is null &&
+			s.Crit is null && s.Alerts is null && s.NotifyOnCritical is null)
 			Icons.Remove(id);
 	}
 }

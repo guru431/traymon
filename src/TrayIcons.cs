@@ -11,9 +11,9 @@ namespace TrayMon;
 /// the alarm survives a colour-blind reader and a bad monitor.
 ///
 /// Registered through Shell_NotifyIcon with its own guidItem rather than through WinForms
-/// NotifyIcon. Without a GUID the Windows 11 / Server 2025 tray treats every icon of a
-/// process as one group and moves them together — with one, each icon keeps its own place
-/// and the user can drag them into any order.
+/// NotifyIcon. Without a GUID the Windows 11 tray treats every icon of a process as one group
+/// and moves them together — with one, each icon keeps its own place and the user can drag them
+/// into any order. Older shells ignore the GUID and behave as they always did.
 ///
 /// Redraws only when the drawn text or colour changes, and destroys the previous icon
 /// handle — GetHicon leaks a GDI handle per call otherwise. Everything a redraw needs beyond
@@ -26,8 +26,15 @@ public sealed class TrayValueIcon : IDisposable
 	private const int NIM_ADD = 0, NIM_MODIFY = 1, NIM_DELETE = 2, NIM_SETVERSION = 4;
 	private const int NIF_MESSAGE = 0x01, NIF_ICON = 0x02, NIF_TIP = 0x04, NIF_INFO = 0x10,
 					  NIF_GUID = 0x20, NIF_SHOWTIP = 0x80;
-	private const int NIIF_WARNING = 0x02;
+	private const int NIIF_INFO = 0x01, NIIF_WARNING = 0x02;
 	private const int NOTIFYICON_VERSION_4 = 4;
+
+	/// <summary>
+	/// The shell was busy and could not answer in time. Documented for Shell_NotifyIcon, and the
+	/// documented response is to wait and try again — the icon may even have been added. TrayMon
+	/// is started by a logon task, which is precisely when explorer.exe is busiest.
+	/// </summary>
+	private const int ERROR_TIMEOUT = 1460;
 
 	private const int WM_TRAYCALLBACK = 0x0400 + 1;   // WM_USER + 1 (WM_APP is 0x8000)
 	private const int WM_CONTEXTMENU = 0x007B, WM_RBUTTONUP = 0x0205;
@@ -71,8 +78,19 @@ public sealed class TrayValueIcon : IDisposable
 	// named after it. Without this the runtime looks for "ShellNotifyIcon", fails, and throws
 	// on every single icon update — which registers no icons at all while the process stays
 	// happily alive.
-	[DllImport("shell32.dll", EntryPoint = "Shell_NotifyIconW", CharSet = CharSet.Unicode)]
+	//
+	// SetLastError, because the difference between "the shell refused this icon" and "the shell
+	// was busy" is only visible there, and the two need opposite handling.
+	[DllImport("shell32.dll", EntryPoint = "Shell_NotifyIconW", CharSet = CharSet.Unicode, SetLastError = true)]
 	private static extern bool ShellNotifyIcon(int message, ref NotifyIconData data);
+
+	/// <summary>
+	/// Register icons without a GUID. Only for the paired-build measurement described in
+	/// CLAUDE.md: two copies of the program cannot both own a GUID, and without this the second
+	/// one spends the whole run fighting the first for identities instead of doing the work being
+	/// measured. Never set in normal operation — icons then group and lose their positions.
+	/// </summary>
+	public static bool NoGuids;
 
 	/// <summary>
 	/// How many icon bitmaps have been drawn, and how many calls have gone into the shell.
@@ -84,10 +102,15 @@ public sealed class TrayValueIcon : IDisposable
 
 	public static long ShellCalls;
 
-	private static bool Shell_NotifyIcon(int message, ref NotifyIconData data)
+	private static bool Shell_NotifyIcon(int message, ref NotifyIconData data) =>
+		Shell_NotifyIcon(message, ref data, out _);
+
+	private static bool Shell_NotifyIcon(int message, ref NotifyIconData data, out int lastError)
 	{
 		Interlocked.Increment(ref ShellCalls);
-		return ShellNotifyIcon(message, ref data);
+		var ok = ShellNotifyIcon(message, ref data);
+		lastError = ok ? 0 : Marshal.GetLastWin32Error();
+		return ok;
 	}
 
 	[DllImport("user32.dll", SetLastError = true)]
@@ -141,6 +164,7 @@ public sealed class TrayValueIcon : IDisposable
 	private bool _tipPending;
 	private long _hoverAt;
 	private int _addFailures;
+	private int _timeouts;
 	private long _retryAt;
 
 	private Bitmap _canvas;
@@ -156,8 +180,21 @@ public sealed class TrayValueIcon : IDisposable
 	/// icon loses the position the user dragged it to.</param>
 	/// <param name="warn">Severity value (not the drawn number) that turns the plate yellow.</param>
 	/// <param name="crit">Severity value that turns the plate red.</param>
+	/// <param name="ink">Digit colour, or null to pick it by the brightness of the plate.</param>
+	/// <param name="text">First number to draw, so the icon reaches the shell exactly once.</param>
+	/// <param name="severity">Severity of that first number.</param>
+	/// <param name="tooltip">First tooltip.</param>
+	/// <remarks>
+	/// The icon is created ready. It used to be born as a grey dash, register itself, and then be
+	/// told its colour, its ink and its real value by three separate calls — two renders and
+	/// three calls into the shell per icon, about 34 renders and 50 calls at startup across a
+	/// full tray, each icon flashing grey on the way. Everything is known at the call site, so it
+	/// is passed in and the first Update is the only NIM_ADD.
+	/// </remarks>
 	public TrayValueIcon(Action<TrayValueIcon> onRightClick, Action<TrayValueIcon> onLeftClick,
-						 Color plate, Guid guid, double warn, double crit)
+						 Color plate, Guid guid, double warn, double crit,
+						 Color? ink = null, string text = null, double? severity = null,
+						 string tooltip = "запуск…")
 	{
 		_onRightClick = onRightClick;
 		_onLeftClick = onLeftClick;
@@ -165,8 +202,10 @@ public sealed class TrayValueIcon : IDisposable
 		_guid = guid;
 		_warn = warn;
 		_crit = crit;
+		_ink = ink;
+		_useGuid = !NoGuids;
 		_window = new MessageWindow(this);
-		Update(null, null, "запуск…");
+		Update(text, severity, tooltip);
 	}
 
 	/// <summary>Changes the plate colour and repaints immediately.</summary>
@@ -201,7 +240,32 @@ public sealed class TrayValueIcon : IDisposable
 	}
 
 	/// <summary>True when the plate currently shows a threshold colour instead of its own.</summary>
-	public bool IsAlerting => _lastSeverity.HasValue && _lastSeverity.Value >= _warn;
+	public bool IsAlerting => _level >= 1;
+
+	/// <summary>-1 dead, 0 own colour, 1 warning, 2 critical. Kept between updates for the
+	/// hysteresis in <see cref="LevelOf"/>.</summary>
+	private int _level;
+
+	/// <summary>
+	/// Which plate this severity calls for, rising immediately and falling only once the value
+	/// has cleared the threshold by a margin.
+	///
+	/// Without the margin a CPU sitting at 69-71 % against a threshold of 70 repainted the icon
+	/// and called into the shell on every single tick, alternating yellow and violet — the exact
+	/// cost the whole project spends its coarse numbers to avoid, reintroduced through the colour.
+	/// Three per cent of the critical threshold is below anything a person would notice and above
+	/// the jitter of every metric here.
+	/// </summary>
+	private int LevelOf(double? severity)
+	{
+		if (severity is null) return -1;
+		var s = severity.Value;
+		var margin = Math.Max(0.5, 0.03 * Math.Max(1, _crit));
+		if (s >= _crit) return 2;
+		if (s >= _warn) return _level == 2 && s >= _crit - margin ? 2 : 1;
+		if (s >= _warn - margin && _level >= 1) return 1;
+		return 0;
+	}
 
 	/// <param name="text">What to draw, null when the source is unavailable.</param>
 	/// <param name="severity">Value the thresholds apply to — a percentage or a temperature,
@@ -221,10 +285,8 @@ public sealed class TrayValueIcon : IDisposable
 			_checkSize = false;
 			if (Math.Max(16, SystemInformation.SmallIconSize.Height) != _side) _forceRedraw = true;
 		}
-		var color = severity is null ? DeadPlate
-			: severity.Value >= _crit ? CritPlate
-			: severity.Value >= _warn ? WarnPlate
-			: _plate;
+		_level = LevelOf(severity);
+		var color = _level switch { -1 => DeadPlate, 2 => CritPlate, 1 => WarnPlate, _ => _plate };
 
 		if (tooltip.Length > TipLimit) tooltip = tooltip.Substring(0, TipLimit);
 
@@ -258,15 +320,19 @@ public sealed class TrayValueIcon : IDisposable
 		else _tipPending = true;
 	}
 
-	/// <summary>Balloon notification on this icon, for a state change worth interrupting for.</summary>
-	public void Notify(string title, string message)
+	/// <summary>
+	/// Balloon notification on this icon, for a state change worth interrupting for.
+	/// The icon is chosen by the caller: "TrayMon is running" and "mains power is back" were
+	/// both delivered under a warning triangle, which is a lie about both.
+	/// </summary>
+	public void Notify(string title, string message, bool warning = true)
 	{
 		if (!_added) return;
 		var data = NewData();
 		data.uFlags |= NIF_INFO;
 		data.szInfoTitle = Cut(title, 63);
 		data.szInfo = Cut(message, 255);
-		data.dwInfoFlags = NIIF_WARNING;
+		data.dwInfoFlags = warning ? NIIF_WARNING : NIIF_INFO;
 		Shell_NotifyIcon(NIM_MODIFY, ref data);
 	}
 
@@ -278,9 +344,9 @@ public sealed class TrayValueIcon : IDisposable
 		if (message == NIM_ADD && Environment.TickCount64 < _retryAt) return;
 
 		var data = NewData();
-		if (Shell_NotifyIcon(message, ref data))
+		if (Shell_NotifyIcon(message, ref data, out var error))
 		{
-			if (message == NIM_ADD) { _added = true; _addFailures = 0; SetVersion(); }
+			if (message == NIM_ADD) { _added = true; _addFailures = 0; _timeouts = 0; SetVersion(); }
 			return;
 		}
 
@@ -293,21 +359,39 @@ public sealed class TrayValueIcon : IDisposable
 			return;
 		}
 
+		// The shell was busy, not unwilling. Deleting the icon and re-adding it here is the wrong
+		// move twice over: the add may in fact have succeeded, and two timeouts in a row — four
+		// seconds of a busy explorer, which is what a logon looks like — used to drop the icon to
+		// registration by window handle for the whole session. Positions are then not applied and
+		// NotifyIconSettings collects entries nothing owns.
+		if (error == ERROR_TIMEOUT)
+		{
+			_timeouts++;
+			var modify = NewData();
+			if (Shell_NotifyIcon(NIM_MODIFY, ref modify)) { _added = true; _timeouts = 0; SetVersion(); return; }
+			_retryAt = Environment.TickCount64 + Math.Min(30000, 2000L * _timeouts);
+			return;
+		}
+
 		// A GUID left over from an earlier exe path blocks the add; drop it and retry.
 		var stale = NewData();
 		Shell_NotifyIcon(NIM_DELETE, ref stale);
 		var retry = NewData();
 		if (Shell_NotifyIcon(NIM_ADD, ref retry)) { _added = true; _addFailures = 0; SetVersion(); return; }
 
-		// Last resort: identify by window+id. Icons then group again, but they still work.
-		_useGuid = false;
-		var plain = NewData();
-		if (Shell_NotifyIcon(NIM_ADD, ref plain)) { _added = true; _addFailures = 0; SetVersion(); return; }
+		// Last resort, and only after the shell has refused for a reason of its own several times
+		// over: identify by window+id. Icons then group again, but they still work.
+		_addFailures++;
+		if (_addFailures >= 3)
+		{
+			_useGuid = false;
+			var plain = NewData();
+			if (Shell_NotifyIcon(NIM_ADD, ref plain)) { _added = true; SetVersion(); return; }
+			_useGuid = !NoGuids;
+		}
 
 		// Back off. Repeating the delete-and-add dance every two seconds for ever is a call into
 		// the shell per icon per tick that cannot succeed.
-		_useGuid = true;
-		_addFailures++;
 		_retryAt = Environment.TickCount64 + Math.Min(60000, 2000L * _addFailures);
 	}
 
@@ -380,8 +464,9 @@ public sealed class TrayValueIcon : IDisposable
 	private void OnTaskbarCreated()
 	{
 		_added = false;
-		_useGuid = true;
+		_useGuid = !NoGuids;
 		_addFailures = 0;
+		_timeouts = 0;
 		_retryAt = 0;
 		_forceRedraw = true;
 		Update(_lastDrawn, _lastSeverity, _lastTip);

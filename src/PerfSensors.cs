@@ -68,6 +68,8 @@ public sealed unsafe class PdhQuery : IDisposable
 	}
 
 	private const uint PDH_MORE_DATA = 0x800007D2;
+	private const uint PDH_CSTATUS_VALID_DATA = 0x00000000;
+	private const uint PDH_CSTATUS_NEW_DATA = 0x00000001;
 
 	private IntPtr _buffer = IntPtr.Zero;
 	private uint _bufferSize;
@@ -99,7 +101,15 @@ public sealed unsafe class PdhQuery : IDisposable
 				for (var i = 0u; i < count; i++)
 				{
 					var name = Marshal.PtrToStringUni(items[i].Name);
-					if (!string.IsNullOrEmpty(name)) into.Add((name, items[i].Value.DoubleValue));
+					if (string.IsNullOrEmpty(name)) continue;
+					// The array as a whole succeeds while individual elements do not: an instance
+					// that appeared after the previous collect has no baseline for a rate counter,
+					// and one that exited has none at all. Both hand back a zero or a stray number
+					// that reads as a real measurement — every twelve seconds among ~250 processes,
+					// every six among adapters and volumes.
+					var status = items[i].Value.CStatus;
+					if (status != PDH_CSTATUS_VALID_DATA && status != PDH_CSTATUS_NEW_DATA) continue;
+					into.Add((name, items[i].Value.DoubleValue));
 				}
 				return;
 			}
@@ -122,8 +132,8 @@ public sealed unsafe class PdhQuery : IDisposable
 }
 
 /// <summary>
-/// CPU load, uptime, network throughput and per-volume disk throughput — everything that comes
-/// from performance counters, in one query and one collect per tick.
+/// CPU load, network throughput and per-volume disk throughput — everything that comes from
+/// performance counters, in one query and one collect per tick.
 ///
 /// CPU deliberately uses the hypervisor counter: on a Hyper-V host the plain \Processor counter
 /// only sees the root partition — it read 13 % while the machine was actually 65 % busy.
@@ -135,10 +145,20 @@ public sealed class PerfSensors : IDisposable
 
 	private readonly PdhQuery _query = new();
 	private readonly PdhQuery _processQuery = new();
-	private readonly PdhQuery _uptimeQuery = new();
-	private readonly IntPtr _cpu, _uptime, _netIn, _netOut, _netBandwidth, _diskRead, _diskWrite, _processIo;
+	private readonly IntPtr _cpu, _netIn, _netOut, _netBandwidth, _diskRead, _diskWrite, _processIo;
 
 	private readonly string[] _notPhysical;
+
+	/// <summary>
+	/// Physical adapters PDH listed at the last read, link or no link. An adapter that is still
+	/// enumerated but carries nothing has an unplugged cable; one that is gone has been disabled
+	/// or removed. Telling those apart is the whole reason the network icon greys out at all.
+	/// </summary>
+	private readonly HashSet<string> _adapters = new(StringComparer.OrdinalIgnoreCase);
+
+	/// <summary>When the process query was last collected, for the baseline rule in
+	/// <see cref="TopIoProcesses"/>.</summary>
+	private long _processCollectedAt;
 
 	// Scratch lists, reused every tick. The number of adapters and volumes barely changes, so
 	// there is no reason to hand the collector a fresh set of lists six times a minute.
@@ -185,26 +205,20 @@ public sealed class PerfSensors : IDisposable
 		// Kept in its own query: ~250 instances are not worth collecting on every tick.
 		_processIo = _processQuery.Add(@"\Process(*)\IO Data Bytes/sec");
 		_processQuery.Collect();
-
-		// Uptime gets its own query for the same reason, and it is not obvious: the counter is
-		// a single number, but a collect gathers every object the query mentions, and the System
-		// object carries Processes and Threads — so reading it walks the process table. Sharing
-		// the main query for it measured 5.7 ms per tick against 1.8 ms, tripling the price of
-		// the cheapest part of the program for a value that changes by two seconds per tick.
-		_uptime = _uptimeQuery.Add(@"\System\System Up Time");
-		_uptimeQuery.Collect();
+		_processCollectedAt = Environment.TickCount64;
 	}
 
 	/// <summary>
-	/// Hours since the machine booted. Deliberately on its own query and its own slow schedule —
-	/// see the constructor.
+	/// Hours since the machine booted.
+	///
+	/// This used to be <c>\System\System Up Time</c> in a PDH query of its own, kept apart
+	/// because collecting the <c>System</c> object walks the process table and cost 5.7 ms per
+	/// tick against 1.8 when it shared the main query. GetTickCount64 answers the same question —
+	/// milliseconds since boot, sleep included, exactly like that counter — for no query, no
+	/// collect and no schedule. The lesson the counter taught (look at the object, not at the
+	/// counter) is still true; <c>\Process(*)</c> illustrates it and is actually needed.
 	/// </summary>
-	public double? ReadUptime()
-	{
-		_uptimeQuery.Collect();
-		var up = _uptimeQuery.Read(_uptime);
-		return up.HasValue && up.Value >= 0 ? up.Value / 3600.0 : null;
-	}
+	public static double ReadUptime() => Environment.TickCount64 / 3_600_000.0;
 
 	/// <summary>
 	/// Refreshes CPU always; network and volumes only when asked. The collect itself is cheap
@@ -220,6 +234,10 @@ public sealed class PerfSensors : IDisposable
 		if (!includeIo) return;
 
 		const double mb = 1024.0 * 1024;
+		// Decimal, not binary, for anything that ends up drawn in megabits: a link is rated in
+		// millions of bits per second, so dividing by 1024² printed a gigabit port as 954 Mbit/s
+		// and understated every reading by 4.9 % against every other tool on the machine.
+		const double netMb = 1_000_000.0;
 
 		// Link speed comes from the same counters as the traffic: on a Hyper-V host the physical
 		// NIC belongs to the external switch and does not appear among .NET network interfaces
@@ -229,14 +247,16 @@ public sealed class PerfSensors : IDisposable
 		_query.ReadArray(_netBandwidth, _bandwidth);
 
 		r.Nets.Clear();
+		_adapters.Clear();
 		Index(_out, _sentBy);
 		Index(_bandwidth, _bandwidthBy);
 		foreach (var x in _in)
 		{
 			if (!IsPhysical(x.Instance)) continue;
-			var outMb = _sentBy.TryGetValue(x.Instance, out var o) ? o / mb : 0;
-			var linkMb = _bandwidthBy.TryGetValue(x.Instance, out var b) ? b / 8 / mb : 0;
-			var inMb = x.Value / mb;
+			_adapters.Add(x.Instance);
+			var outMb = _sentBy.TryGetValue(x.Instance, out var o) ? o / netMb : 0;
+			var linkMb = _bandwidthBy.TryGetValue(x.Instance, out var b) ? b / 8 / netMb : 0;
+			var inMb = x.Value / netMb;
 			// An unplugged adapter reports zero bandwidth; one that carries traffic is kept even
 			// then, so a driver that does not fill Current Bandwidth in cannot hide its icon.
 			if (linkMb <= 0 && inMb <= 0 && outMb <= 0) continue;
@@ -268,20 +288,45 @@ public sealed class PerfSensors : IDisposable
 		foreach (var x in items) into[x.Instance] = x.Value;
 	}
 
+	/// <summary>Adapters PDH still lists, whether or not they have a link. See <see cref="_adapters"/>.</summary>
+	public bool AdapterStillThere(string name) => _adapters.Contains(name);
+
 	/// <summary>
-	/// Processes with the most I/O. Counted across all devices — per-process counters do not
-	/// split by volume, and the only thing that would is a kernel trace costing 5-10 % of a core.
+	/// Processes with the most I/O, summed per executable name. Counted across all devices —
+	/// per-process counters do not split by volume, and the only thing that would is a kernel
+	/// trace costing 5-10 % of a core.
+	///
+	/// A rate counter in PDH is the delta between the last two collects, and this query is only
+	/// collected when the volumes are actually moving. After a quiet night the first sample would
+	/// therefore report the average over that whole night and name whichever process was busy
+	/// before it went quiet — so a sample that follows a long gap is used as a baseline only.
 	/// </summary>
-	public List<(string Name, double Mb)> TopIoProcesses(int take)
+	public List<(string Name, double Mb)> TopIoProcesses(int take, int maxGapMs)
 	{
+		var now = Environment.TickCount64;
+		var stale = now - _processCollectedAt > maxGapMs;
 		_processQuery.Collect();
+		_processCollectedAt = now;
+		if (stale) return new List<(string, double)>();
+
 		const double mb = 1024.0 * 1024;
 		_processQuery.ReadArray(_processIo, _processIoRaw);
-		return _processIoRaw
-			.Where(x => x.Instance != "_Total" && x.Instance != "Idle" && x.Value > 0)
-			.OrderByDescending(x => x.Value)
+		// Summed by name: four Code processes doing 24, 18, 6 and 2 MB/s are one editor, and
+		// three rows of the same name pushed everything else out of a list of three.
+		var byName = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+		foreach (var x in _processIoRaw)
+		{
+			if (x.Value <= 0 || x.Instance == "_Total" || x.Instance == "Idle") continue;
+			// PDH invents "chrome#3" for duplicates; the name before the '#' is the process.
+			var hash = x.Instance.IndexOf('#');
+			var name = hash > 0 ? x.Instance.Substring(0, hash) : x.Instance;
+			byName.TryGetValue(name, out var sum);
+			byName[name] = sum + x.Value;
+		}
+		return byName
+			.OrderByDescending(p => p.Value)
 			.Take(take)
-			.Select(x => (x.Instance, x.Value / mb))
+			.Select(p => (p.Key, p.Value / mb))
 			.ToList();
 	}
 
@@ -311,6 +356,5 @@ public sealed class PerfSensors : IDisposable
 	{
 		_query.Dispose();
 		_processQuery.Dispose();
-		_uptimeQuery.Dispose();
 	}
 }

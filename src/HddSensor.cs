@@ -1,6 +1,5 @@
 using System.Diagnostics;
-using System.Globalization;
-using System.Text.RegularExpressions;
+using System.Text.Json;
 
 namespace TrayMon;
 
@@ -11,28 +10,29 @@ namespace TrayMon;
 /// and several other controllers answer CSMI pass-through, and smartmontools speaks it. Hence
 /// an external smartctl.exe instead of an API call.
 ///
-/// Devices are discovered by `smartctl --scan-open -d csmi`, so this works on any machine with
-/// such a controller and needs no per-host configuration. Results are deduplicated by serial
-/// number: some drivers answer with the same disk on several CSMI ports.
+/// Devices are discovered by `smartctl --scan-open -d csmi` (configurable, because LSI and
+/// Adaptec want a different -d), so this works on any machine with such a controller and needs
+/// no per-host configuration. Results are deduplicated by serial number: some drivers answer
+/// with the same disk on several CSMI ports.
+///
+/// Everything is read from smartctl's own JSON rather than from its human-readable table. The
+/// table cost three separate bugs: only attribute 194 was matched, so Samsung and Intel SATA
+/// SSDs — which report temperature in 190 — had no icon at all; a disk whose WHEN_FAILED column
+/// said FAILING_NOW no longer matched the pattern, so a disk vanished from the tray exactly as
+/// it started to die; and NVMe and SCSI answers have no attribute table to match. smartctl picks
+/// the right attribute out of its own drive database, so none of that is ours to guess.
 ///
 /// If smartctl.exe is missing, or there is no RAID controller, this simply returns nothing and
 /// the icons do not appear.
 /// </summary>
 public sealed class HddSensor
 {
-	private static readonly Regex TempLine = new(@"^\s*194\s+Temperature_Celsius.*?-\s+(\d+)", RegexOptions.Multiline | RegexOptions.Compiled);
-	private static readonly Regex TempFallback = new(@"Temperature:\s+(\d+) Celsius", RegexOptions.Compiled);
-	private static readonly Regex ModelLine = new(@"(?:Device Model|Model Number):\s+(.+)", RegexOptions.Compiled);
-	private static readonly Regex SerialLine = new(@"Serial Number:\s+(\S+)", RegexOptions.Compiled);
-	private static readonly Regex ScanLine = new(@"^(/dev/\S+)", RegexOptions.Multiline | RegexOptions.Compiled);
-	private static readonly Regex HealthLine = new(
-		@"(?:SMART overall-health self-assessment test result|SMART Health Status):\s+(\S+)", RegexOptions.Compiled);
-
 	/// <summary>One device answers in about 100 ms; ten seconds means it is not going to.</summary>
 	private const int RunTimeoutMs = 10000;
 
 	private readonly string _exe;
-	private List<string> _devices;   // discovered once; ports do not move while Windows runs
+	private readonly string _scanArgs;
+	private List<(string Device, string Type)> _devices;   // discovered once; ports do not move while Windows runs
 
 	/// <summary>Why the last run failed, if it did; shown by the diagnostics window.</summary>
 	public string LastError { get; private set; }
@@ -44,12 +44,17 @@ public sealed class HddSensor
 	public HddSensor(ToolSettings tools = null)
 	{
 		// README calls smartctl an optional external tool, so where it lives is a setting;
-		// empty means the copy next to TrayMon.exe, which is the normal case. The path is never
-		// taken from PATH or the working directory — this runs with an elevated token.
+		// empty means the copy next to TrayMon.exe, which is the normal case. A relative path is
+		// resolved against the program folder and never against the working directory — under
+		// the logon task that directory is %SystemRoot%\System32, and this process holds an
+		// elevated token, so "smartctl.exe" would have meant "whatever is in System32".
 		var configured = tools?.Smartctl;
 		_exe = string.IsNullOrWhiteSpace(configured)
 			? Path.Combine(AppContext.BaseDirectory, "smartctl.exe")
-			: configured;
+			: Path.IsPathFullyQualified(configured)
+				? configured
+				: Path.Combine(AppContext.BaseDirectory, configured);
+		_scanArgs = tools?.SmartctlScan ?? "--scan-open -d csmi";
 	}
 
 	/// <summary>
@@ -68,33 +73,26 @@ public sealed class HddSensor
 		_devices ??= Discover();
 		var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-		foreach (var device in _devices)
+		foreach (var (device, type) in _devices)
 		{
 			// -H rides along in the query that was already being made: a disk that is failing
 			// matters more than a disk that is warm, and it costs no extra process and no extra
 			// poll — the same run, the same ten minutes, one more flag.
-			var output = Run($"-H -A -i {device}");
-			if (output is null) continue;
+			// -n standby,0 leaves a sleeping HDD asleep: waking a parked drive every ten minutes
+			// to read its temperature costs the drive far more than the reading is worth.
+			using var json = RunJson($"-j -H -A -i -n standby,0 -d {type} {device}");
+			if (json is null) continue;
 
-			var temp = TempLine.Match(output);
-			var value = temp.Success
-				? double.Parse(temp.Groups[1].Value, CultureInfo.InvariantCulture)
-				: TempFallback.Match(output) is { Success: true } f
-					? double.Parse(f.Groups[1].Value, CultureInfo.InvariantCulture)
-					: double.NaN;
-			if (double.IsNaN(value)) continue;
+			var root = json.RootElement;
+			var temp = Nested(root, "temperature", "current");
+			if (temp is null) continue;
 
-			var serial = SerialLine.Match(output);
-			var key = serial.Success ? serial.Groups[1].Value : device;
+			var serial = Text(root, "serial_number") ?? "";
+			var key = serial.Length > 0 ? serial : device;
 			if (!seen.Add(key)) continue;   // same disk answering on another port
 
-			var model = ModelLine.Match(output);
-			var name = model.Success ? model.Groups[1].Value.Trim() : "RAID disk";
-			var health = HealthLine.Match(output);
-			disks.Add(new RaidDisk(
-				name, value,
-				serial.Success ? serial.Groups[1].Value : "",
-				health.Success ? health.Groups[1].Value.Trim() : ""));
+			var name = Text(root, "model_name") ?? Text(root, "device_model") ?? "RAID disk";
+			disks.Add(new RaidDisk(name.Trim(), temp.Value, serial, Health(root)));
 		}
 
 		// Nothing answered: the controller or the disks changed, so look again next time.
@@ -109,13 +107,59 @@ public sealed class HddSensor
 		!health.Equals("PASSED", StringComparison.OrdinalIgnoreCase) &&
 		!health.Equals("OK", StringComparison.OrdinalIgnoreCase);
 
-	private List<string> Discover()
+	private static string Health(JsonElement root)
 	{
-		var found = new List<string>();
-		var scan = Run("--scan-open -d csmi");
-		if (scan is null) return found;
-		foreach (Match m in ScanLine.Matches(scan)) found.Add(m.Groups[1].Value);
+		if (!root.TryGetProperty("smart_status", out var status)) return "";
+		if (!status.TryGetProperty("passed", out var passed)) return "";
+		return passed.ValueKind == JsonValueKind.True ? "PASSED" : "FAILING_NOW";
+	}
+
+	private static string Text(JsonElement root, string name) =>
+		root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+			? value.GetString()
+			: null;
+
+	private static double? Nested(JsonElement root, string outer, string inner)
+	{
+		if (!root.TryGetProperty(outer, out var section)) return null;
+		if (!section.TryGetProperty(inner, out var value)) return null;
+		return value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out var d) ? d : null;
+	}
+
+	private List<(string Device, string Type)> Discover()
+	{
+		var found = new List<(string, string)>();
+		using var json = RunJson("-j " + _scanArgs);
+		if (json is null) return found;
+		if (!json.RootElement.TryGetProperty("devices", out var devices) ||
+			devices.ValueKind != JsonValueKind.Array) return found;
+		foreach (var device in devices.EnumerateArray())
+		{
+			var name = Text(device, "name");
+			var type = Text(device, "type");
+			// Both go straight onto a command line, so anything that would split or requote the
+			// arguments is refused rather than escaped. Real values look like "/dev/csmi0,0"
+			// and "csmi"; nothing legitimate here contains whitespace or a quote.
+			if (!Plain(name) || (type is not null && !Plain(type))) continue;
+			if (!string.IsNullOrEmpty(name)) found.Add((name, string.IsNullOrEmpty(type) ? "auto" : type));
+		}
 		return found;
+	}
+
+	private static bool Plain(string value) =>
+		!string.IsNullOrEmpty(value) && value.All(c => !char.IsWhiteSpace(c) && c != '"' && c != '\'');
+
+	/// <summary>Runs smartctl and parses its JSON; null when it did not run or did not answer.</summary>
+	private JsonDocument RunJson(string args)
+	{
+		var output = Run(args);
+		if (string.IsNullOrWhiteSpace(output)) return null;
+		try { return JsonDocument.Parse(output); }
+		catch (JsonException ex)
+		{
+			LastError = "smartctl вернул не JSON: " + ex.Message;
+			return null;
+		}
 	}
 
 	private string Run(string args)
@@ -130,20 +174,25 @@ public sealed class HddSensor
 				// stderr is deliberately left alone. Redirecting a pipe nobody reads is a
 				// deadlock waiting for an unusual CSMI answer: the pipe fills at about 4 KB,
 				// smartctl blocks writing to it, stops writing stdout and never closes it, and
-				// ReadToEnd below never returns — the timeout underneath it is never reached,
-				// because control never gets that far.
+				// the read below never returns.
 				RedirectStandardError = false,
 			});
-			var output = p.StandardOutput.ReadToEnd();
+
+			// Started before the wait, not read to the end before it. ReadToEnd blocks until the
+			// child closes stdout, so the timeout underneath it was never reached: a smartctl
+			// stuck on a dying disk — the very case the timeout was written for — held the
+			// refresh flag for ever, greyed out every RAID icon and outlived the process.
+			var reader = p.StandardOutput.ReadToEndAsync();
 			if (!p.WaitForExit(RunTimeoutMs))
 			{
-				// A smartctl stuck on a dying disk would otherwise be left running, one more
-				// every ten minutes, each holding handles on the device.
 				LastError = "smartctl не ответил за " + RunTimeoutMs / 1000 + " с: " + args;
 				try { p.Kill(entireProcessTree: true); } catch (Exception) { /* already gone */ }
+				try { reader.Wait(1000); } catch (Exception) { /* the pipe dies with the child */ }
 				return null;
 			}
-			return output;
+			p.WaitForExit();   // lets the reader finish now that the child is done
+			try { return reader.GetAwaiter().GetResult(); }
+			catch (Exception) { return null; }
 		}
 		catch (Exception ex)
 		{

@@ -13,7 +13,26 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>TrayMon.ico</ApplicationIcon>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <DebugType>none</DebugType>
+
+    <!-- Embedded, not none. Stripping the symbols altogether left "последняя ошибка" in the
+         diagnostics window with a type and a message and no place: a stack trace without line
+         numbers, for a program whose whole error story is one remembered line. Embedded costs
+         nothing at run time (nothing reads it until an exception is formatted) and keeps the
+         deliverable a single file rather than an exe plus a .pdb. -->
+    <DebugType>embedded</DebugType>
+
+    <!-- A machine that has .NET 10 and not .NET 8 is an ordinary machine now, and without this
+         the program refuses to start there rather than rolling forward. The ReadyToRun code is
+         then re-jitted on a newer runtime — which is the cost, and it is smaller than not
+         starting at all. -->
+    <RollForward>LatestMajor</RollForward>
+
+    <!-- The concurrent collector runs a background thread and keeps extra heap for it. This
+         program allocates almost nothing per tick, so it buys latency nobody needs and pays for
+         it in exactly the number the README admits losing on. TieredPGO makes the steady-state
+         polling path a little tighter for free. -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
 
     <!-- Walking the PDH counter arrays with a pointer instead of the marshaller: the structure
          is blittable, and \Process(*) has about 250 instances. -->
@@ -38,9 +57,9 @@
     <Company>TrayMon</Company>
     <Authors>TrayMon</Authors>
     <Copyright>MIT</Copyright>
-    <Version>1.1.0</Version>
-    <FileVersion>1.1.0.0</FileVersion>
-    <InformationalVersion>1.1.0</InformationalVersion>
+    <Version>1.2.0</Version>
+    <FileVersion>1.2.0.0</FileVersion>
+    <InformationalVersion>1.2.0</InformationalVersion>
   </PropertyGroup>
 
   <!-- Only for CPU package and NVMe temperatures: MSR and SMART reads go through the kernel
@@ -50,5 +69,23 @@
   <ItemGroup>
     <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.4" />
   </ItemGroup>
+
+  <!-- The pure logic — the BER parser, the GUID pool, the scale behind the summary icon, the
+       formatters, the settings round-trip — is checked by tests/TrayMon.Tests. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="TrayMon.Tests" />
+  </ItemGroup>
+
+  <!-- The dependencies drag in native builds for Linux, macOS and Android: a Mono POSIX helper
+       for linux-armel, serial-port natives for half a dozen architectures. None of it can ever
+       load in a win-x64 WinExe, all of it ships, and the README promises "one exe plus a few
+       DLLs". Anything under runtimes\ that is not win- is dropped from the publish output. -->
+  <Target Name="DropForeignRuntimes" AfterTargets="ComputeResolvedFilesToPublishList">
+    <ItemGroup>
+      <ResolvedFileToPublish
+        Remove="@(ResolvedFileToPublish)"
+        Condition="$([System.String]::Copy('%(ResolvedFileToPublish.RelativePath)').Replace('/','\').StartsWith('runtimes\')) And !$([System.String]::Copy('%(ResolvedFileToPublish.RelativePath)').Replace('/','\').StartsWith('runtimes\win'))" />
+    </ItemGroup>
+  </Target>
 
 </Project>

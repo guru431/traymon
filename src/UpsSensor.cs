@@ -15,8 +15,14 @@ namespace TrayMon;
 ///
 /// The answer is treated as hostile input. Windows has no privileged ports, so any process of
 /// any user can occupy UDP 127.0.0.1:161 while the real agent is stopped and reply whatever it
-/// likes to this one, which runs elevated. Hence: the PDU type, the request id and the community
-/// are checked before a byte is believed, and every TLV read is bounded by the packet.
+/// likes to this one, which runs elevated.
+///
+/// What the checks here do and do not buy is worth being precise about. A process squatting on
+/// the port receives the GetRequest itself, so it holds the community, the request id and the
+/// OIDs: checking the PDU type, the id and the community only keeps out *other* datagrams —
+/// stale replies and stray traffic — not a squatter. Against a squatter the defence is that
+/// there is nothing to attack: the parser is bounded so it cannot be hung or crashed by what
+/// comes back, and the worst a forgery can achieve is to lie about the battery.
 /// </summary>
 public sealed class UpsSensor
 {
@@ -27,7 +33,6 @@ public sealed class UpsSensor
 	private const string LoadOid = "1.3.6.1.4.1.318.1.1.1.4.2.3.0";       // % of rated load
 	private const string ReplaceOid = "1.3.6.1.4.1.318.1.1.1.2.2.4.0";    // 2 = battery needs replacing
 
-	private const int OnBatteryStatus = 3;
 	private const int NeedsReplacing = 2;
 
 	private const byte GetResponse = 0xA2;
@@ -36,6 +41,18 @@ public sealed class UpsSensor
 	private readonly int _port;
 	private readonly int _timeoutMs;
 	private readonly byte[] _community;
+
+	/// <summary>
+	/// The varbinds still being asked for. An SNMPv1 GET is all or nothing: an agent that does
+	/// not carry one of these OIDs — Back-UPS models and PowerChute Personal have no output load,
+	/// non-APC agents have none of them — answers noSuchName and returns *no* values at all. The
+	/// icon then said "no answer from the SNMP agent" about an agent that had answered. The
+	/// offending varbind is named by the error index, so it is dropped and remembered.
+	/// </summary>
+	private readonly List<string> _oids = new()
+		{ CapacityOid, RunTimeOid, StatusOid, LoadOid, ReplaceOid };
+
+	private readonly List<string> _dropped = new();
 
 	private int _requestId = 1;
 
@@ -47,6 +64,10 @@ public sealed class UpsSensor
 	public string LastError { get; private set; }
 
 	public string Endpoint => $"{_host}:{_port}";
+
+	/// <summary>True when the agent answered but has no battery-charge OID — almost always an
+	/// agent that does not speak the APC PowerNet MIB at all.</summary>
+	public bool ChargeUnavailable => _dropped.Contains(CapacityOid);
 
 	public UpsSensor(UpsSettings settings)
 	{
@@ -64,18 +85,37 @@ public sealed class UpsSensor
 	/// </summary>
 	public void Read(Readings r)
 	{
-		Dictionary<string, (byte Tag, byte[] Raw)> answer;
+		Dictionary<string, (byte Tag, byte[] Raw)> answer = null;
 		try
 		{
-			answer = Get(CapacityOid, RunTimeOid, StatusOid, LoadOid, ReplaceOid);
-			LastError = null;
+			// At most three passes: each failed one drops exactly the varbind the agent named.
+			for (var attempt = 0; attempt < 3 && answer is null; attempt++)
+			{
+				var reply = Get(_oids);
+				if (reply.Error == 0) { answer = reply.Vars; break; }
+				if (reply.ErrorIndex >= 1 && reply.ErrorIndex <= _oids.Count && _oids.Count > 1)
+				{
+					_dropped.Add(_oids[reply.ErrorIndex - 1]);
+					_oids.RemoveAt(reply.ErrorIndex - 1);
+					continue;
+				}
+				throw new InvalidOperationException(
+					$"агент вернул ошибку SNMP {reply.Error.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+			}
+			if (answer is null) throw new InvalidOperationException("агент не отдал ни одного из запрошенных OID");
+			LastError = _dropped.Count == 0
+				? null
+				: $"агент не отдаёт {_dropped.Count.ToString(System.Globalization.CultureInfo.InvariantCulture)} " +
+				  "из пяти значений — они не показываются";
 		}
 		catch (Exception ex)
 		{
 			// Agent down, service stopped, or the community was refused. Nothing is known now —
 			// including whether the UPS is on battery, so that flag goes back to "unknown"
 			// rather than staying at whatever the last answer said.
-			LastError = ex.GetType().Name + ": " + ex.Message;
+			LastError = ex is SocketException { SocketErrorCode: SocketError.ConnectionReset }
+				? "порт закрыт: служба SNMP-агента не запущена"
+				: ex.GetType().Name + ": " + ex.Message;
 			r.Ups = UpsReading.Silent;
 			return;
 		}
@@ -89,8 +129,7 @@ public sealed class UpsSensor
 			Charge = Number(answer, CapacityOid),
 			RunTimeMin = ticks.HasValue ? ticks.Value / 6000.0 : null,   // hundredths of a second → minutes
 			Load = Number(answer, LoadOid),
-			// null, not false: an agent that does not carry this OID must not be read as "on line".
-			OnBattery = status.HasValue ? status.Value == OnBatteryStatus : null,
+			Status = status.HasValue ? (int)status.Value : null,
 			NeedsNewBattery = Number(answer, ReplaceOid) == NeedsReplacing,
 		};
 	}
@@ -110,7 +149,15 @@ public sealed class UpsSensor
 
 	// ---- SNMPv1 ----
 
-	private Dictionary<string, (byte Tag, byte[] Raw)> Get(params string[] oids)
+	/// <summary>One parsed GetResponse: the varbinds, plus which one the agent objected to.</summary>
+	internal sealed class SnmpReply
+	{
+		public int Error;
+		public int ErrorIndex;
+		public Dictionary<string, (byte Tag, byte[] Raw)> Vars;
+	}
+
+	private SnmpReply Get(List<string> oids)
 	{
 		var bindings = new List<byte>();
 		foreach (var oid in oids)
@@ -148,6 +195,12 @@ public sealed class UpsSensor
 
 			byte[] response;
 			try { response = udp.Receive(ref from); }
+			catch (SocketException e) when (e.SocketErrorCode == SocketError.ConnectionReset)
+			{
+				// ICMP port unreachable: nothing is listening. Reporting that as "the agent did
+				// not answer in 1500 ms" sent people looking for a slow network.
+				throw;
+			}
 			catch (SocketException) { throw new TimeoutException($"агент не ответил за {_timeoutMs} мс"); }
 
 			var parsed = ParseVarBinds(response, requestId);
@@ -161,7 +214,12 @@ public sealed class UpsSensor
 	/// as well. Returns null when the datagram is not a well-formed answer to <paramref name="requestId"/>
 	/// — the caller keeps waiting rather than believing it.
 	/// </summary>
-	private Dictionary<string, (byte Tag, byte[] Raw)> ParseVarBinds(byte[] buf, int requestId)
+	/// <remarks>
+	/// Internal rather than private so the tests can throw crafted datagrams at it directly —
+	/// including the one whose negative TLV length used to walk the cursor backwards and hold a
+	/// logical processor until the process was killed. That is not a bug a tray can demonstrate.
+	/// </remarks>
+	internal SnmpReply ParseVarBinds(byte[] buf, int requestId)
 	{
 		try
 		{
@@ -183,13 +241,20 @@ public sealed class UpsSensor
 			if (SignedOf(id) != requestId) return null;           // an answer to some earlier query
 
 			var error = ReadValue(buf, ref at, limit);            // error status
-			Skip(buf, ref at, limit);                             // error index
+			var index = ReadValue(buf, ref at, limit);            // error index — which varbind
 			var end = Enter(buf, ref at, limit, out var listTag);
 			if (listTag != 0x30) return null;
 			end = Math.Min(end, limit);
 
-			var result = new Dictionary<string, (byte, byte[])>();
-			if (error.Raw.Length > 0 && error.Raw[0] != 0) return result;   // noSuchName and friends
+			var reply = new SnmpReply
+			{
+				Error = (int)Math.Clamp(SignedOf(error), 0, 255),
+				// 1-based, and it is the whole point of the retry: it names the OID this agent
+				// does not carry, so the next request can go out without it.
+				ErrorIndex = (int)Math.Clamp(SignedOf(index), 0, 255),
+				Vars = new Dictionary<string, (byte, byte[])>(),
+			};
+			if (reply.Error != 0) return reply;   // noSuchName and friends: no values at all
 
 			while (at < end)
 			{
@@ -202,10 +267,10 @@ public sealed class UpsSensor
 				if (bindTag != 0x30 || bindingEnd <= start || bindingEnd > end) return null;
 				var name = ReadValue(buf, ref at, bindingEnd);
 				var value = ReadValue(buf, ref at, bindingEnd);
-				result[DecodeOid(name.Raw)] = value;
+				reply.Vars[DecodeOid(name.Raw)] = value;
 				at = bindingEnd;
 			}
-			return result;
+			return reply;
 		}
 		catch (FormatException)
 		{
