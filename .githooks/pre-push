@@ -1,0 +1,164 @@
+#!/bin/sh
+# pre-push secret-guard for a PUBLIC repository.
+#
+# pre-commit and commit-msg only see what they were present for: anything
+# committed BEFORE the guard was enabled — which is the whole history of this
+# repo, the guard was added late — or with `--no-verify`, still reaches the
+# remote on push. This hook scans the objects a push would actually publish:
+# the ones the TARGET remote does not have yet, plus their commit messages.
+#
+# Activate once per clone:   git config core.hooksPath .githooks
+# Bypass a confirmed false positive:   git push --no-verify
+set -eu
+
+hook_dir=$(dirname "$0")
+lib="$hook_dir/_scan.sh"
+if [ ! -f "$lib" ]; then
+  # Fail CLOSED. Exiting 0 here would turn "the guard is missing" into "the
+  # guard passed" — on a public remote that is the one direction you cannot be
+  # wrong in. Deleting the library must not become a way to publish unscanned
+  # objects.
+  echo "BLOCKED: $lib not found — the secret scan cannot run." >&2
+  echo "Restore it, or push with --no-verify if you have checked by hand." >&2
+  exit 1
+fi
+# shellcheck source=.githooks/_scan.sh
+. "$lib"
+
+repo_root=$(git rev-parse --show-toplevel)
+fail=0
+
+# Blobs above this are not hand-written text (the bundled .ico, build leftovers);
+# a pasted key lives in a small file. Keeps a first push of the repo bounded.
+max_blob_bytes=1048576
+
+# 1) Refs being pushed. stdin: <local ref> <local sha> <remote ref> <remote sha>
+# The TARGET remote is $1 (a name, or a URL for an ad-hoc push).
+target_remote="${1:-}"
+shas=""
+excludes=""
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  # An all-zeros local sha is a branch DELETION — it publishes no objects.
+  case "$local_sha" in
+    *[!0]*) shas="$shas $local_sha" ;;
+    *) continue ;;
+  esac
+  case "$remote_sha" in
+    *[!0]*) excludes="$excludes $remote_sha" ;;
+  esac
+done
+[ -n "$shas" ] || exit 0
+
+# Exclude only what the TARGET remote has. Excluding objects present on ANY
+# remote would treat a commit already pushed to the private origin as published
+# when it reaches the PUBLIC github for the first time — exactly the case this
+# repo is in. An unnamed remote (a bare URL) matches no ref pattern, which just
+# means everything gets scanned.
+case "$target_remote" in
+  ''|*[!A-Za-z0-9._/-]*) ;;
+  *) excludes="$excludes --remotes=$target_remote" ;;
+esac
+
+tmpdir=$(mktemp -d 2>/dev/null || echo "$repo_root/.pre-push.tmp")
+mkdir -p "$tmpdir"
+trap 'rm -rf "$tmpdir"' EXIT INT TERM
+objects="$tmpdir/objects"
+blobs="$tmpdir/blobs"
+
+# 2) New objects only. `awk NF>1` keeps the ones carrying a path (blobs, trees);
+# commits and tags print bare. shellcheck disable=SC2086 — both must word-split.
+if [ -n "$excludes" ]; then
+  # shellcheck disable=SC2086
+  git rev-list --objects $shas --not $excludes 2>/dev/null | awk 'NF>1' > "$objects" || true
+else
+  # shellcheck disable=SC2086
+  git rev-list --objects $shas 2>/dev/null | awk 'NF>1' > "$objects" || true
+fi
+
+# One batch-check pass instead of a process spawn per object.
+awk '{print $1}' "$objects" \
+  | git cat-file --batch-check='%(objectname) %(objecttype) %(objectsize)' 2>/dev/null \
+  | awk -v max="$max_blob_bytes" '$2 == "blob" && $3 <= max {print $1}' > "$blobs" || true
+
+# SAY what was skipped: "scanned everything under 1 MiB" is a different promise
+# from "scanned everything", and only the second one is worth staying silent about.
+oversize=$(awk '{print $1}' "$objects" \
+  | git cat-file --batch-check='%(objecttype) %(objectsize)' 2>/dev/null \
+  | awk -v max="$max_blob_bytes" '$1 == "blob" && $2 > max' | wc -l | tr -d ' ')
+if [ "${oversize:-0}" -gt 0 ]; then
+  echo "pre-push: NOTE — $oversize blob(s) over $max_blob_bytes bytes were NOT scanned"
+fi
+
+# 3) COMMIT MESSAGES. commit-msg catches new ones, but this hook also publishes
+# commits written before the guard existed. A token in a message is disclosed
+# exactly as typed and `git log` keeps it forever.
+# shellcheck disable=SC2086
+if [ -n "$excludes" ]; then
+  msgs=$(git log --format='%H%n%B%n' $shas --not $excludes 2>/dev/null || true)
+else
+  msgs=$(git log --format='%H%n%B%n' $shas 2>/dev/null || true)
+fi
+if [ -n "$msgs" ]; then
+  if ! scan_text "an outgoing COMMIT MESSAGE" "$msgs"; then
+    fail=1
+  fi
+fi
+
+# 4) Fast path: one `cat-file --batch` stream through one grep, instead of two
+# spawns per blob (~160ms each on Windows — minutes on a first push). It is
+# deliberately over-eager: a hit here only means "look properly in step 5", so a
+# false alarm costs seconds and never a wrong verdict.
+#
+# `tr -d '\000'` is what makes UTF-16 visible: a UTF-16 blob reads as
+# `s\0k\0-\0…` and matches nothing, so without this the precise pass would never
+# run. UTF-16 is what `>` and `Out-File` produce in Windows PowerShell 5.1 —
+# the shell this project is built and released from.
+pat="$tmpdir/patterns"
+: > "$pat"
+sp="$repo_root/.sanitize-patterns"
+if [ -f "$sp" ]; then
+  # tr -d '\r': a CRLF-saved denylist would leave a trailing \r on every line
+  # and silently match nothing.
+  grep -vE '^[[:space:]]*$' "$sp" 2>/dev/null | tr -d '\r' > "$pat" || true
+fi
+
+suspect=0
+if [ -s "$blobs" ] && git cat-file --batch < "$blobs" 2>/dev/null | tr -d '\000' \
+     | grep -qaE -e "$(scan_generic_pattern)"; then
+  suspect=1
+fi
+if [ "$suspect" -eq 0 ] && [ -s "$blobs" ] && [ -s "$pat" ]; then
+  if git cat-file --batch < "$blobs" 2>/dev/null | tr -d '\000' | grep -qaiEf "$pat"; then
+    suspect=1
+  fi
+fi
+
+if [ "$suspect" -ne 0 ]; then
+  # 5) Something matched — now spend the per-blob spawns to name it.
+  # Redirect, not a pipe: a pipe runs the loop in a subshell and every `fail=1`
+  # set inside it is lost when that subshell exits.
+  while read -r sha; do
+    [ -n "$sha" ] || continue
+    path=$(grep -m1 "^$sha " "$objects" | cut -d' ' -f2- || true)
+    # .githooks/ documents token FORMATS on purpose — same exclusion pre-commit makes.
+    case "$path" in .githooks/*) continue ;; esac
+    body=$(git cat-file blob "$sha" 2>/dev/null | tr -d '\000' || true)
+    if ! scan_text "$path (blob $sha)" "$body"; then
+      fail=1
+    fi
+  done < "$blobs"
+fi
+
+rm -rf "$tmpdir"
+trap - EXIT INT TERM
+
+if [ "$fail" -ne 0 ]; then
+  echo ""
+  echo "Push aborted — this is a PUBLIC repository."
+  echo "Objects already committed cannot be fixed by a new commit: rewrite the"
+  echo "history that carries them (git rebase -i / git filter-repo). Rotate"
+  echo "anything real that leaked."
+  echo "For a confirmed false positive: git push --no-verify"
+  exit 1
+fi
+exit 0

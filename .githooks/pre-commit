@@ -1,0 +1,91 @@
+#!/bin/sh
+# pre-commit secret-guard for a PUBLIC repository.
+# Blocks commits that add sensitive files, high-entropy key formats, or
+# personal strings listed in an untracked .sanitize-patterns file.
+#
+# Activate once per clone:   git config core.hooksPath .githooks
+# Bypass a confirmed false positive:   git commit --no-verify
+set -eu
+
+hook_dir=$(dirname "$0")
+# shellcheck source=.githooks/_scan.sh
+. "$hook_dir/_scan.sh"
+
+repo_root=$(git rev-parse --show-toplevel)
+fail=0
+
+# 1) Block sensitive filenames entering the tree (allow *.example templates).
+# ACMR (not just A) so a rename/copy INTO a sensitive name is caught by its
+# destination path — --name-only prints the new path for renames.
+# The .env pattern uses (\..+)? so multi-suffix names like .env.production.local
+# are matched too (the single-suffix form missed them); templates are re-included.
+#
+# The template exemption is applied to the BASENAME, and only as a trailing
+# `.example` suffix. Applying it to the whole path (the previous `grep -ivE
+# '\.example(\.|$)'`) meant ANY directory containing `.example.` in its name
+# exempted everything under it: `foo.example.bar/id_rsa` sailed through the
+# filename check entirely. A template is a file named `<something>.example`,
+# never a file that merely lives under such a directory.
+added=$(git diff --cached --name-only --diff-filter=ACMR || true)
+if [ -n "$added" ]; then
+  bad=$(printf '%s\n' "$added" \
+    | grep -iE '(^|/)(\.env(\..+)?$|.*\.pem$|.*\.key$|.*\.p12$|.*\.pfx$|id_rsa|id_ed25519|id_dsa|vault\.env|\.sanitize-patterns$)' \
+    | awk -F/ '{ b = tolower($NF); if (b !~ /\.example$/) print }' || true)
+  if [ -n "$bad" ]; then
+    echo "BLOCKED: refusing to commit sensitive file(s):"
+    printf '  %s\n' $bad
+    fail=1
+  fi
+fi
+
+# 1b) Reject newly added binary files. `git diff --cached --numstat` reports
+# binary blobs as "-<TAB>-<TAB><path>"; text files report numeric add/del counts.
+# Note: grep ERE does not portably treat \t as a tab, so use a literal tab.
+tab=$(printf '\t')
+binstat=$(git diff --cached --numstat --diff-filter=A 2>/dev/null || true)
+if [ -n "$binstat" ]; then
+  binfiles=$(printf '%s\n' "$binstat" | grep -E "^-${tab}-${tab}" | cut -f3- || true)
+  if [ -n "$binfiles" ]; then
+    echo "BLOCKED: binary file staged, use --no-verify if intentional:"
+    printf '  %s\n' $binfiles
+    fail=1
+  fi
+fi
+
+# 1c) Reject newly-added build output and runtime state. All gitignored, but a
+# `git add -f` could still stage them — TrayMon.json/csv carry this machine's
+# disk serials, SMART attributes and drive model names, and bin/obj/out hold
+# compiled copies of whatever was in the tree at build time.
+if [ -n "$added" ]; then
+  arts=$(printf '%s\n' "$added" \
+    | grep -iE '(^|/)(bin/|obj/|out/|TrayMon\.(json|csv)(\.bad)?$|smartctl\.exe$|drivedb\.h$)' || true)
+  if [ -n "$arts" ]; then
+    echo "BLOCKED: build output / runtime state staged (gitignored; use --no-verify only if truly intended):"
+    printf '  %s\n' $arts
+    fail=1
+  fi
+fi
+
+# Collect staged diff once. Exclude ONLY .githooks/_scan.sh (its regex constants
+# would self-match the token formats it defines) — every other file under
+# .githooks/ IS scanned, so a concrete token pasted into a hook is caught.
+# Scan only ADDED lines (leading '+', minus the '+++' file header): a commit that
+# REMOVES a leaked value (e.g. untracking bench/results) must not be blocked by
+# the secret it is deleting — only newly INTRODUCED secrets matter.
+diff_content=$(git diff --cached --unified=0 -- . ':(exclude).githooks/_scan.sh' 2>/dev/null || git diff --cached --unified=0)
+added_content=$(printf '%s\n' "$diff_content" | grep '^+' | grep -v '^+++' || true)
+
+# 2+3) Secret formats and the personal denylist. Both live in .githooks/_scan.sh
+# so the commit-msg hook applies EXACTLY the same rules — the message used to be
+# gated by nothing at all, locally or in CI.
+if ! scan_text "staged changes" "$added_content"; then
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo ""
+  echo "Commit aborted — this is a PUBLIC repository."
+  echo "Fix the lines above, or for a confirmed false positive: git commit --no-verify"
+  exit 1
+fi
+exit 0

@@ -1,0 +1,24 @@
+# Shell scripts must be LF: CRLF breaks the shebang and gives `$'\r'` errors
+# under Git Bash / WSL / CI. The git hooks are shell scripts too, and a hook
+# that fails to start is a guard that protects nothing.
+*.sh text eol=lf
+.githooks/* text eol=lf
+
+# C# / MSBuild sources are edited in Visual Studio on Windows — keep them CRLF
+# in the working tree so a build or an IDE save does not rewrite every line.
+*.cs text eol=crlf
+*.csproj text eol=crlf
+*.manifest text eol=crlf
+
+# PowerShell must be CRLF *and* keep its BOM (see CLAUDE.md): PS 5.1 reads a
+# BOM-less file as CP1251 and mangles non-ASCII.
+*.ps1 text eol=crlf
+
+# CMD batch files must be CRLF — with LF ends cmd.exe misparses multi-line
+# `( )` blocks and goto loops. Kept LAST: in .gitattributes the last matching
+# rule wins.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Binary: never normalize.
+*.ico binary

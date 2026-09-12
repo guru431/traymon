@@ -1,0 +1,51 @@
+#!/bin/sh
+# commit-msg secret-guard for a PUBLIC repository.
+#
+# The pre-commit hook only ever scanned `git diff --cached`, so the whole class
+# "secret or internal host typed into `git commit -m`" was gated by nothing:
+# not locally, and not in CI either — gitleaks looks at patch content, and even
+# if it read messages it has no access to `.sanitize-patterns`, which is
+# untracked/gitignored by design and is the ONLY gate for internal hosts,
+# private IPs and personal names. On a public repo the value is disclosed at
+# push time, and `--amend` does not retract it from mirrors or forks.
+#
+# Activate once per clone:   git config core.hooksPath .githooks
+# Bypass a confirmed false positive:   git commit --no-verify
+set -eu
+
+hook_dir=$(dirname "$0")
+# shellcheck source=.githooks/_scan.sh
+. "$hook_dir/_scan.sh"
+
+msg_file=$1
+msg_source=${2-}
+# Comment lines are dropped ONLY for an editor-composed message, where git's
+# own template lists staged file names and a blocked path there is not
+# something the author typed.
+#
+# For `git commit -m` the default cleanup is `whitespace`, which KEEPS `#`
+# lines verbatim in the final message — so `-m $'fix
+# deploy to <host>'`
+# shipped that line into the repository while the hook never looked at it.
+# `$2` is the message source: "message" for -m/-F, "template"/"commit"/"merge"
+# or empty for the editor path.
+case "$msg_source" in
+  message|"")
+    if [ "$msg_source" = "message" ]; then
+      msg=$(cat "$msg_file")
+    else
+      msg=$(git stripspace --strip-comments < "$msg_file" 2>/dev/null || grep -v '^#' "$msg_file" || true)
+    fi
+    ;;
+  *)
+    msg=$(git stripspace --strip-comments < "$msg_file" 2>/dev/null || grep -v '^#' "$msg_file" || true)
+    ;;
+esac
+
+if ! scan_text "the commit message" "$msg"; then
+  echo ""
+  echo "Commit aborted — this is a PUBLIC repository."
+  echo "Rewrite the message above, or for a confirmed false positive: git commit --no-verify"
+  exit 1
+fi
+exit 0
