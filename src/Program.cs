@@ -198,6 +198,7 @@ internal static class Program
 		if (lhm.Ring0Note is not null) Say($"ring-0 device:  {lhm.Ring0Note}");
 		Say($"elevated:       {(TrayApp.IsElevated ? "yes" : "no")}");
 		Say($"smartctl:       {(hdd.Available ? "found" : "not found")}");
+		if (hdd.Note is not null) Say($"                {hdd.Note}");
 		// Whether, not who: the identity would be a domain and account name, and this output goes
 		// into public issue trackers. The name is in the diagnostics window instead.
 		// The whole load path, not just the folder: a file inside a well-protected folder can carry
@@ -3292,6 +3293,7 @@ internal sealed class TrayApp : ApplicationContext
 		text.AppendLine($"NVML (GPU):       {(_gpu.CardCount > 0 ? $"карт: {_gpu.CardCount}" : "нет — " + (_gpu.LastError ?? "драйвер NVIDIA не найден"))}");
 		text.AppendLine($"smartctl:         {(_hdd.Available ? _hdd.ExePath : "не найден: " + _hdd.ExePath)}");
 		if (_hdd.LastError is not null) text.AppendLine($"                  {_hdd.LastError}");
+		if (_hdd.Note is not null) text.AppendLine($"                  {_hdd.Note}");
 		text.AppendLine($"ИБП:              {(_ups.Present ? "отвечает" : "нет ответа")} на {_ups.Endpoint}" +
 						$"{(_ups.LastError is null ? "" : " — " + _ups.LastError)}");
 		text.AppendLine();

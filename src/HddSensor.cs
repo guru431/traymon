@@ -131,20 +131,41 @@ public sealed class HddSensor
 	/// </summary>
 	public void Rediscover() => _devices = null;
 
+	/// <summary>Where the tool is weakly protected but is started anyway — see <see cref="Safe"/>.
+	/// Shown by the diagnostics window and by <c>--once</c>.</summary>
+	public string Note { get; private set; }
+
 	/// <summary>
 	/// Whether this smartctl may be started at all. The path is configurable and this process runs
-	/// elevated, so a copy in a folder an ordinary process can write to is a way to have anything
-	/// executed with an administrator token — the same argument that already refuses to create the
-	/// autostart task from such a folder. Checked once; an ACL is not free and does not move.
+	/// elevated, so a tool an ordinary process can replace is a way to have anything executed with
+	/// an administrator token.
+	///
+	/// Refusing is only worth it where it buys something, and that is the narrow case: the
+	/// program's own folder is protected and the configured tool is somewhere weaker — the
+	/// settings file redirecting an elevated process out of a safe folder. When the program folder
+	/// itself is writable by a non-administrator, TrayMon.exe and every DLL beside it can be
+	/// replaced just as easily; refusing to start smartctl there changes nothing about the risk and
+	/// silently costs the RAID temperatures, which is exactly what it did on a live machine.
+	/// Checked once: an ACL is not free and does not move.
 	/// </summary>
 	private bool Safe()
 	{
 		if (_safe.HasValue) return _safe.Value;
-		_safe = !Autostart.UnsafeToRun(_exe, out var who);
-		if (_safe == false)
-			LastError = "smartctl.exe не запущен: его может подменить " + who +
-						", а TrayMon работает с правами администратора";
-		return _safe.Value;
+		_safe = true;
+		var protectedFolder = !Autostart.WritableByNonAdmins(AppContext.BaseDirectory, out _);
+		if (!Autostart.UnsafeToRun(_exe, out var who)) return true;
+
+		if (protectedFolder)
+		{
+			_safe = false;
+			LastError = "smartctl.exe не запущен: он вне защищённой папки программы, и его может " +
+						"подменить " + who + ", а TrayMon работает с правами администратора";
+			return false;
+		}
+		Note = "smartctl.exe запускается из папки, доступной на запись (" + who + "). " +
+			   "TrayMon работает с правами администратора, поэтому подменённый файл получил бы их же — " +
+			   "но то же верно и для самого TrayMon.exe рядом с ним";
+		return true;
 	}
 
 	/// <summary>True when the disk reported anything other than a clean bill of health.</summary>

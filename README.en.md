@@ -236,8 +236,12 @@ somebody had deliberately silenced.
   With no link speed the utilisation is not invented: there is no threshold colour and the tooltip
   says the link speed is unknown.
 - `Tools.Smartctl` — a relative path is resolved against the program folder, never against the
-  working directory. **If the file or its folder is writable by a non-administrator it is not
-  started at all**: TrayMon runs elevated, and a replaced smartctl would inherit that.
+  working directory. It is refused only in the case where refusing buys something: **the program
+  folder is protected and the configured tool is somewhere weaker** — a settings file leading an
+  elevated process out of a safe folder. When the program folder itself is writable by a
+  non-administrator, smartctl runs as usual and the diagnostics window says so: TrayMon.exe and
+  its DLLs sitting beside it can be replaced just as easily, so blocking one tool would change
+  nothing about the risk while silently costing the RAID temperatures.
 - `Sensors.UseSensorDriver` — `false` keeps LibreHardwareMonitor, and the WinRing0 driver it
   loads, unopened. CPU temperature, motherboard fans and NVMe wear then have no source and say so.
 - `Log` — `time;id;value;unit;severity;status;measured_at`, one row per icon. The raw number in a
