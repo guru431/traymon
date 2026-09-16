@@ -29,16 +29,23 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 if (-not (Test-Path $Dll)) { throw "Нет сборки $Dll — сначала dotnet publish src/TrayMon.csproj -c Release -o out" }
 if (-not (Test-Path $Readme)) { throw "Нет файла $Readme" }
 
-# Подпись строки — её первое слово, с числами, заменёнными на N. Нарочно грубо: цель —
-# заметить исчезнувшую, переименованную или новую *строку*, а не сверить значения, которые
-# у каждой машины свои.
+# Подпись строки — всё до первого разрыва в два и более пробелов (либо до двоеточия),
+# с числами, заменёнными на N. Грубо, но не «первое слово»: прежняя версия сводила
+# `GPU 0 mem`, `GPU 0 fan` и `GPU 0` к одному `GPU N`, а строки с отступом — состав блока
+# `cost, ms` и вывод `--icons` — выбрасывала целиком, поэтому не замечала ни новых
+# источников, ни исчезнувших.
 function Get-Labels([string[]]$lines) {
     $labels = @()
     foreach ($line in $lines) {
         if ($line -notmatch '\S') { continue }
-        if ($line -match '^\s') { continue }
-        $label = ($line -split '\s+')[0].Trim()
-        $label = $label -replace '\d+', 'N'
+        $text = $line.Trim()
+        # Подпись: до двоеточия либо до первого двойного пробела.
+        if ($text -match '^([^:]{1,30}):') { $label = $Matches[1] }
+        else { $label = ($text -split '\s{2,}')[0] }
+        $label = ($label -replace '\d+', 'N').Trim()
+        # Хвост значения без разделителя («uptime N.N h») — оставляем только первое слово,
+        # если после подписи всё равно остались числа.
+        if ($label -match '\sN') { $label = ($label -split '\s+')[0] }
         if ($label) { $labels += $label }
     }
     $labels | Sort-Object -Unique
@@ -73,7 +80,8 @@ $stale = $fromDocs | Where-Object { $_ -notin $fromCode }
 # Строки, которых на конкретной машине может не быть: нет карты NVIDIA, нет ИБП, нет RAID,
 # нет батареи, запуск без прав администратора. Их отсутствие в выводе — не расхождение
 # с документом.
-$optional = @('GPU', 'raid', 'ups', 'disk', 'fan', 'battery', 'ring-N')
+$optional = @('GPU', 'GPU N', 'GPU N mem', 'GPU N fan', 'raid', 'ups', 'disk', 'fan', 'battery',
+              'ring-N device', 'ring-N')
 $stale = $stale | Where-Object { $_ -notin $optional }
 $missing = $missing | Where-Object { $_ -notin $optional }
 

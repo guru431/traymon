@@ -148,6 +148,8 @@ public sealed class PerfSensors : IDisposable
 	private readonly IntPtr _cpu, _netIn, _netOut, _netBandwidth, _diskRead, _diskWrite, _processIo;
 
 	private readonly string[] _notPhysical;
+	private readonly string[] _include;
+	private readonly NetSettings _net;
 
 	/// <summary>
 	/// Physical adapters PDH listed at the last read, link or no link. An adapter that is still
@@ -185,7 +187,9 @@ public sealed class PerfSensors : IDisposable
 
 	public PerfSensors(NetSettings net = null)
 	{
+		_net = net;
 		_notPhysical = net?.Filters ?? NetSettings.BuiltInNotPhysical;
+		_include = net?.Included ?? Array.Empty<string>();
 
 		_cpu = _query.Add(HyperVCpu);
 		if (_cpu != IntPtr.Zero) CounterInUse = HyperVCpu;
@@ -256,6 +260,12 @@ public sealed class PerfSensors : IDisposable
 			_adapters.Add(x.Instance);
 			var outMb = _sentBy.TryGetValue(x.Instance, out var o) ? o / netMb : 0;
 			var linkMb = _bandwidthBy.TryGetValue(x.Instance, out var b) ? b / 8 / netMb : 0;
+			// A configured link speed wins. Current Bandwidth is missing on some drivers and
+			// meaningless on Wi-Fi (it is the momentary rate, not a capacity), and without a
+			// figure to divide by the utilisation reads 0 % — which looks like an idle line
+			// rather than like an unknown one.
+			var configured = _net?.BandwidthFor(x.Instance);
+			if (configured.HasValue) linkMb = configured.Value / 8;
 			var inMb = x.Value / netMb;
 			// An unplugged adapter reports zero bandwidth; one that carries traffic is kept even
 			// then, so a driver that does not fill Current Bandwidth in cannot hide its icon.
@@ -338,6 +348,15 @@ public sealed class PerfSensors : IDisposable
 		// able to grow this without bound.
 		if (_physical.Count > 256) _physical.Clear();
 		var decision = true;
+		// An explicit include wins over the denylist. Switching the VPN or the virtual adapter you
+		// actually watch back on used to mean copying the whole built-in denylist out of the README
+		// and editing it — and every substring forgotten on the way brought back a Bluetooth icon.
+		foreach (var wanted in _include)
+			if (instance.Contains(wanted, StringComparison.OrdinalIgnoreCase))
+			{
+				_physical[instance] = true;
+				return true;
+			}
 		foreach (var bad in _notPhysical)
 		{
 			if (!instance.Contains(bad, StringComparison.OrdinalIgnoreCase)) continue;

@@ -7,10 +7,22 @@ namespace TrayMon;
 /// <summary>One video card, as NVML reports it.</summary>
 public sealed record GpuReading(
 	int Index, string Name, double? Load, double? Temp,
-	double? FanRpm, double? FanDuty, double? MemLoad, double MemUsedGb, double MemTotalGb);
+	double? FanRpm, double? FanDuty, double? MemLoad, double MemUsedGb, double MemTotalGb)
+{
+	/// <summary>
+	/// Stable identity of this card: the tail of its NVML UUID, or the enumeration index when the
+	/// driver does not give one. The index alone moved when a card was added, removed or swapped,
+	/// and the settings — colour, caption, thresholds — then belonged to a different card.
+	/// </summary>
+	public string Key { get; init; }
+}
 
-/// <summary>One disk behind a RAID controller.</summary>
-public sealed record RaidDisk(string Name, double Temp, string Serial, string Health);
+/// <summary>
+/// One disk behind a RAID controller. The temperature is optional: a disk that answers
+/// <c>smart_status.passed = false</c> without a temperature was dropped from the list entirely,
+/// so the one answer that matters most produced no icon and no alarm at all.
+/// </summary>
+public sealed record RaidDisk(string Name, double? Temp, string Serial, string Health);
 
 /// <summary>
 /// One directly attached disk: temperature, and the NVMe wear figures when the sensor library
@@ -19,6 +31,13 @@ public sealed record RaidDisk(string Name, double Temp, string Serial, string He
 /// </summary>
 public sealed record DiskReading(string Name, double Temp, double? WearPercent, double? SparePercent)
 {
+	/// <summary>
+	/// Serial number, where the storage driver supplied one. Not used as the icon id — that stays
+	/// the model, which is what a person reads in the settings file — but it is what tells two
+	/// identical models apart, so their ordinal suffixes stop swapping between reboots.
+	/// </summary>
+	public string Serial { get; init; }
+
 	/// <summary>Wear or spare capacity past the point where the drive is expected to fail.</summary>
 	public bool Worn => WearPercent >= 95 || SparePercent is >= 0 and < 10;
 }
@@ -138,6 +157,26 @@ public sealed class Readings
 	public volatile List<DiskReading> Disks = new();
 	public volatile List<RaidDisk> RaidDisks = new();
 	public volatile UpsReading Ups = UpsReading.Silent;
+
+	// When each of those was actually measured (Environment.TickCount64; 0 = never). Without them
+	// a hung reader looked perfectly fresh: the UI thread re-marked its icons as seen on every tick
+	// from the last cached snapshot, and the flag that keeps a slow read from overlapping itself is
+	// exactly what stops a new attempt being made. Written with Volatile.Write from the pool
+	// threads and read with Volatile.Read on the UI thread; a long is written atomically on x64,
+	// and the pairing with the snapshot above is what matters.
+	/// <summary>When the GPU and the wildcard PDH arrays were last read. They are read on the UI
+	/// thread but not on every tick, so without a stamp the same cached number was added to the
+	/// five-minute window two or three times over.</summary>
+	public long GpusAt;
+
+	public long IoAt;
+
+	public long SlowAt;
+	public long DisksAt;
+	public long RaidAt;
+	public long UpsAt;
+	public long SpaceAt;
+	public long TopIoAt;
 }
 
 /// <summary>Physical memory via GlobalMemoryStatusEx — a single syscall, no counters involved.</summary>
@@ -278,6 +317,7 @@ public sealed class GpuSensor : IDisposable
 	[DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetFanSpeed_v2")] private static extern int NvmlGetFanDuty(IntPtr device, uint fan, out uint speed);
 	[DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetFanSpeedRPM")] private static extern int NvmlGetFanRpm(IntPtr device, ref NvmlFanSpeedInfo info);
 	[DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetNumFans")] private static extern int NvmlGetNumFans(IntPtr device, out uint count);
+	[DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetUUID", CharSet = CharSet.Ansi)] private static extern int NvmlGetUuid(IntPtr device, StringBuilder uuid, uint length);
 
 	private const int NvmlNotSupported = 3;
 	private const int NvmlFunctionNotFound = 13;
@@ -309,6 +349,7 @@ public sealed class GpuSensor : IDisposable
 		public int Index;
 		public IntPtr Handle;
 		public string Name;
+		public string Key;
 		public bool FanRpmSupported = true;
 		public uint Fans = 1;
 	}
@@ -316,7 +357,15 @@ public sealed class GpuSensor : IDisposable
 	private readonly List<Card> _cards = new();
 	private bool _ready;
 	private int _lostStreak;
-	private long _reinitAt;
+
+	/// <summary>
+	/// When the next attempt to bring NVML up is allowed. A separate piece of state from the error
+	/// streak on purpose: <c>Reinit</c> used to zero the streak *before* trying, so a failed
+	/// attempt left "not ready" with a streak of zero — and the only path back asked for a streak
+	/// above zero. One failure therefore meant the GPU icons never came back, whatever happened to
+	/// the driver afterwards.
+	/// </summary>
+	private long _retryAt;
 
 	/// <summary>Why NVML did not come up; shown by --once and by the diagnostics window.</summary>
 	public string LastError { get; private set; }
@@ -344,7 +393,13 @@ public sealed class GpuSensor : IDisposable
 				foreach (var candidate in known)
 					if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out var handle))
 						return handle;
-				return IntPtr.Zero;
+				// Failing, not falling back. Returning IntPtr.Zero hands the name back to the
+				// default probing order, which starts with the folder the executable is in — so on
+				// every machine without an NVIDIA driver, which is the ordinary case, a DLL dropped
+				// next to TrayMon.exe would have been loaded into a process holding an elevated
+				// token. That is precisely what naming the absolute paths was for.
+				throw new DllNotFoundException(
+					"nvml.dll не найдена по доверенным путям (" + string.Join("; ", known) + ")");
 			});
 		}
 		catch (Exception) { /* already set, or the runtime refused — default probing then */ }
@@ -355,17 +410,30 @@ public sealed class GpuSensor : IDisposable
 		// Everything: a driver too old for nvmlInit_v2 throws EntryPointNotFound, a 32-bit
 		// nvml.dll on PATH throws BadImageFormat, and this runs in a field initialiser of
 		// TrayApp — an escaping exception there stops the program from starting at all.
+		// A failed start is retried on the same schedule as a lost driver: installing the driver
+		// while the program runs used to require restarting the program, because the initial
+		// failure had no path back at all.
+		_retryAt = Environment.TickCount64 + ReinitEveryMs;
 		try
 		{
 			var rc = NvmlInit();
-			if (rc != 0) { LastError = "nvmlInit вернул код " + rc; return; }
-			if (!Enumerate()) { LastError = "NVML не отдал ни одной карты"; NvmlShutdown(); return; }
+			if (rc != 0) { LastError = "nvmlInit вернул код " + rc; Release(); return; }
+			if (!Enumerate()) { LastError = "NVML не отдал ни одной карты"; Release(); return; }
 			_ready = true;
 		}
 		catch (Exception ex)
 		{
 			LastError = ex.GetType().Name + ": " + ex.Message;   // no NVIDIA driver — GPU rows stay empty
 		}
+	}
+
+	/// <summary>
+	/// Lets a partially initialised library go. nvmlInit that returns an error may still have
+	/// taken resources, and so has one that came up and then failed to enumerate.
+	/// </summary>
+	private static void Release()
+	{
+		try { NvmlShutdown(); } catch (Exception) { /* nothing was up */ }
 	}
 
 	private bool Enumerate()
@@ -375,7 +443,13 @@ public sealed class GpuSensor : IDisposable
 		for (var i = 0u; i < Math.Min(count, MaxCards); i++)
 		{
 			if (NvmlGetHandle(i, out var device) != 0) continue;
-			var card = new Card { Index = (int)i, Handle = device, Name = NameOf(device, (int)i) };
+			var card = new Card
+			{
+				Index = (int)i,
+				Handle = device,
+				Name = NameOf(device, (int)i),
+				Key = KeyOf(device, (int)i),
+			};
 			// Asked once: a card with three fans reports the stopped one only if all of them are
 			// looked at, and the count does not change while the driver is loaded.
 			if (NvmlGetNumFans(device, out var fans) == 0 && fans is > 0 and <= 8) card.Fans = fans;
@@ -392,22 +466,47 @@ public sealed class GpuSensor : IDisposable
 	/// </summary>
 	private void Reinit()
 	{
-		_reinitAt = Environment.TickCount64;
-		_lostStreak = 0;
+		// The next attempt is scheduled before this one runs, and the error streak is left alone:
+		// what decides whether a retry is allowed is time, not how many errors happened to be
+		// counted. The previous order — zero the streak, then try — made a failed attempt the last
+		// one for the lifetime of the process.
+		_retryAt = Environment.TickCount64 + ReinitEveryMs;
 		try
 		{
-			NvmlShutdown();
+			Release();
 			_ready = false;
 			var rc = NvmlInit();
-			if (rc != 0) { LastError = "nvmlInit после сброса драйвера вернул код " + rc; return; }
-			if (!Enumerate()) { LastError = "после сброса драйвера NVML не отдал ни одной карты"; return; }
+			if (rc != 0) { LastError = "nvmlInit после сброса драйвера вернул код " + rc; Release(); return; }
+			if (!Enumerate()) { LastError = "после сброса драйвера NVML не отдал ни одной карты"; Release(); return; }
 			_ready = true;
+			_lostStreak = 0;
 			LastError = null;
 		}
 		catch (Exception ex)
 		{
 			LastError = ex.GetType().Name + ": " + ex.Message;
+			Release();
 		}
+	}
+
+	/// <summary>
+	/// The tail of the card's NVML UUID — stable across reboots, driver updates and a reshuffled
+	/// PCI order, which the enumeration index is not. Shortened to eight characters because it
+	/// ends up in the settings file as part of an icon id that a person has to read.
+	/// </summary>
+	private static string KeyOf(IntPtr device, int index)
+	{
+		try
+		{
+			var buffer = new StringBuilder(96);
+			if (NvmlGetUuid(device, buffer, (uint)buffer.Capacity) == 0 && buffer.Length >= 8)
+			{
+				var uuid = buffer.ToString().Trim();
+				return uuid.Substring(uuid.Length - 8);
+			}
+		}
+		catch (Exception) { /* older driver without the entry point */ }
+		return index.ToString(System.Globalization.CultureInfo.InvariantCulture);
 	}
 
 	private static string NameOf(IntPtr device, int index)
@@ -426,8 +525,9 @@ public sealed class GpuSensor : IDisposable
 	{
 		if (!_ready)
 		{
-			// Not ready and past the cool-down: the driver may have come back since.
-			if (_lostStreak > 0 && Environment.TickCount64 - _reinitAt > ReinitEveryMs) Reinit();
+			// Not ready and past the cool-down: the driver may have come back since. No condition
+			// on the error streak — see _retryAt.
+			if (Environment.TickCount64 >= _retryAt) Reinit();
 			if (!_ready) { r.Gpus = new List<GpuReading>(); return; }
 		}
 		try
@@ -445,7 +545,7 @@ public sealed class GpuSensor : IDisposable
 			// replaced, not a busy moment. Handles do not recover on their own.
 			if (lost == _cards.Count && _cards.Count > 0) _lostStreak++;
 			else { _lostStreak = 0; LastError = null; }
-			if (_lostStreak >= 3 && Environment.TickCount64 - _reinitAt > ReinitEveryMs) Reinit();
+			if (_lostStreak >= 3 && Environment.TickCount64 >= _retryAt) Reinit();
 		}
 		catch (Exception ex)
 		{
@@ -456,6 +556,10 @@ public sealed class GpuSensor : IDisposable
 			LastError = ex.GetType().Name + ": " + ex.Message;
 			r.Gpus = new List<GpuReading>();
 			_lostStreak++;
+			// The same path as a run of error codes. An exception used to bypass the Reinit call,
+			// which sat inside the try block it had just left, so a driver that throws instead of
+			// returning a code was never recovered from.
+			if (_lostStreak >= 3 && Environment.TickCount64 >= _retryAt) Reinit();
 		}
 	}
 
@@ -511,12 +615,15 @@ public sealed class GpuSensor : IDisposable
 			if (NvmlGetFanDuty(card.Handle, fan, out var duty) == 0)
 				fanDuty = fanDuty.HasValue ? Math.Max(fanDuty.Value, duty) : duty;
 
-		return new GpuReading(card.Index, card.Name, load, temp, fanRpm, fanDuty, memLoad, usedGb, totalGb);
+		return new GpuReading(card.Index, card.Name, load, temp, fanRpm, fanDuty, memLoad, usedGb, totalGb)
+		{
+			Key = card.Key,
+		};
 	}
 
 	public void Dispose()
 	{
-		if (_ready) { try { NvmlShutdown(); } catch (Exception) { /* driver already gone */ } }
+		if (_ready) Release();
 		_ready = false;
 	}
 }
@@ -541,6 +648,10 @@ public sealed class LhmSensor : IDisposable
 
 	public bool Available { get; }
 
+	/// <summary>Switched off in the settings rather than unavailable — a deliberate choice, and
+	/// the interface has to say so instead of reporting a blocked driver.</summary>
+	public bool Disabled { get; private set; }
+
 	/// <summary>
 	/// The library opened but its kernel driver cannot read anything. WinRing0 1.2.0 — the driver
 	/// this version ships — is on the Microsoft vulnerable-driver block list and is refused by
@@ -557,8 +668,22 @@ public sealed class LhmSensor : IDisposable
 	/// <summary>Why the sensor library did not come up; shown by --once.</summary>
 	public string LastError { get; private set; }
 
-	public LhmSensor()
+	/// <param name="settings">
+	/// <c>UseSensorDriver = false</c> keeps the library — and the ring-0 driver it loads —
+	/// unopened. Somebody who only wants CPU load, memory, network and disk temperatures has no
+	/// reason to carry a block-listed driver for readings they are not looking at, and switching
+	/// the source off is a different thing from it failing: the icons say "выключено в настройках"
+	/// rather than blaming HVCI.
+	/// </param>
+	public LhmSensor(SensorSettings settings = null)
 	{
+		if (settings is not null && !settings.UseSensorDriver)
+		{
+			Available = false;
+			Disabled = true;
+			LastError = "выключено настройкой Sensors.UseSensorDriver — драйвер датчиков не загружался";
+			return;
+		}
 		try
 		{
 			_computer = new Computer

@@ -35,6 +35,14 @@ public sealed class UpsSensor
 
 	private const int NeedsReplacing = 2;
 
+	/// <summary>
+	/// SNMPv1 <c>noSuchName</c> — the one error that means "this agent does not carry that OID"
+	/// and therefore the one that justifies dropping a varbind for good. Everything else
+	/// (<c>tooBig</c>, <c>genErr</c>) is the agent having a bad moment, and treating those the same
+	/// way permanently removed the battery charge or the power status from a UPS that had both.
+	/// </summary>
+	private const int NoSuchName = 2;
+
 	private const byte GetResponse = 0xA2;
 
 	private readonly string _host;
@@ -50,6 +58,9 @@ public sealed class UpsSensor
 	/// offending varbind is named by the error index, so it is dropped and remembered.
 	/// </summary>
 	private readonly List<string> _oids = new()
+		{ CapacityOid, RunTimeOid, StatusOid, LoadOid, ReplaceOid };
+
+	private static readonly string[] AllOids =
 		{ CapacityOid, RunTimeOid, StatusOid, LoadOid, ReplaceOid };
 
 	private readonly List<string> _dropped = new();
@@ -93,7 +104,11 @@ public sealed class UpsSensor
 			{
 				var reply = Get(_oids);
 				if (reply.Error == 0) { answer = reply.Vars; break; }
-				if (reply.ErrorIndex >= 1 && reply.ErrorIndex <= _oids.Count && _oids.Count > 1)
+				// Only noSuchName removes a varbind. Any non-zero status used to, so one bad
+				// moment from the agent could cost the charge or the power status for the rest of
+				// the session — and nothing, not even "Опросить датчики сейчас", brought it back.
+				if (reply.Error == NoSuchName &&
+					reply.ErrorIndex >= 1 && reply.ErrorIndex <= _oids.Count && _oids.Count > 1)
 				{
 					_dropped.Add(_oids[reply.ErrorIndex - 1]);
 					_oids.RemoveAt(reply.ErrorIndex - 1);
@@ -121,18 +136,35 @@ public sealed class UpsSensor
 		}
 
 		Present = true;
-		var ticks = Number(answer, RunTimeOid);
-		var status = Number(answer, StatusOid);
+		var ticks = InRange(Number(answer, RunTimeOid), 0, 100 * 60 * 60 * 100);   // up to 100 hours
+		var status = InRange(Number(answer, StatusOid), 1, 255);
 		r.Ups = new UpsReading
 		{
 			Answered = true,
-			Charge = Number(answer, CapacityOid),
+			// Range-checked, not merely parsed. A gauge of -1 or 200 is not a charge, and it went
+			// straight onto the plate and into the five-minute window as if it had been measured;
+			// the parser only ever asked whether the bytes were an integer.
+			Charge = InRange(Number(answer, CapacityOid), 0, 100),
 			RunTimeMin = ticks.HasValue ? ticks.Value / 6000.0 : null,   // hundredths of a second → minutes
-			Load = Number(answer, LoadOid),
+			Load = InRange(Number(answer, LoadOid), 0, 200),
 			Status = status.HasValue ? (int)status.Value : null,
 			NeedsNewBattery = Number(answer, ReplaceOid) == NeedsReplacing,
 		};
 	}
+
+	/// <summary>
+	/// Asks for the full set of OIDs again. What an agent carries changes when PowerChute is
+	/// upgraded or the UPS is replaced, and a varbind dropped as noSuchName had no way back.
+	/// </summary>
+	public void Rediscover()
+	{
+		_dropped.Clear();
+		_oids.Clear();
+		_oids.AddRange(AllOids);
+	}
+
+	private static double? InRange(double? value, double min, double max) =>
+		value.HasValue && value.Value >= min && value.Value <= max ? value : null;
 
 	private static double? Number(Dictionary<string, (byte Tag, byte[] Raw)> vars, string oid)
 	{

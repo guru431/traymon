@@ -62,29 +62,58 @@ esac
 tmpdir=$(mktemp -d 2>/dev/null || echo "$repo_root/.pre-push.tmp")
 mkdir -p "$tmpdir"
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
+all="$tmpdir/all"
 objects="$tmpdir/objects"
+types="$tmpdir/types"
 blobs="$tmpdir/blobs"
+tags="$tmpdir/tags"
 
-# 2) New objects only. `awk NF>1` keeps the ones carrying a path (blobs, trees);
-# commits and tags print bare. shellcheck disable=SC2086 — both must word-split.
+# Every step below checks its own exit code and REFUSES on failure. They used to
+# end in `|| true` inside a pipeline, so "git could not enumerate these objects"
+# — an unknown sha, a corrupt pack, a missing object after a rewrite — produced
+# an empty list and a clean verdict. On a public remote that is the one direction
+# you cannot be wrong in.
+die() {
+  echo "BLOCKED: $1" >&2
+  echo "The secret scan could not run, so nothing is pushed. Fix it, or push with --no-verify" >&2
+  echo "if you have checked the outgoing objects by hand." >&2
+  exit 1
+}
+
+# 2) New objects only. shellcheck disable=SC2086 — both must word-split.
+rc=0
 if [ -n "$excludes" ]; then
   # shellcheck disable=SC2086
-  git rev-list --objects $shas --not $excludes 2>/dev/null | awk 'NF>1' > "$objects" || true
+  git rev-list --objects $shas --not $excludes > "$all" 2>"$tmpdir/err" || rc=$?
 else
   # shellcheck disable=SC2086
-  git rev-list --objects $shas 2>/dev/null | awk 'NF>1' > "$objects" || true
+  git rev-list --objects $shas > "$all" 2>"$tmpdir/err" || rc=$?
 fi
+[ "$rc" -eq 0 ] || die "git rev-list failed (rc=$rc): $(tr '\n' ' ' < "$tmpdir/err")"
+
+# `awk NF>1` keeps the ones carrying a path (blobs, trees); commits and tags
+# print bare. The path is needed for the message in step 5, the bare ones are
+# still typed and scanned below.
+awk 'NF>1' "$all" > "$objects"
 
 # One batch-check pass instead of a process spawn per object.
-awk '{print $1}' "$objects" \
-  | git cat-file --batch-check='%(objectname) %(objecttype) %(objectsize)' 2>/dev/null \
-  | awk -v max="$max_blob_bytes" '$2 == "blob" && $3 <= max {print $1}' > "$blobs" || true
+rc=0
+awk '{print $1}' "$all" \
+  | git cat-file --batch-check='%(objectname) %(objecttype) %(objectsize)' > "$types" 2>"$tmpdir/err" || rc=$?
+[ "$rc" -eq 0 ] || die "git cat-file --batch-check failed (rc=$rc): $(tr '\n' ' ' < "$tmpdir/err")"
+
+awk -v max="$max_blob_bytes" '$2 == "blob" && $3 <= max {print $1}' "$types" > "$blobs"
+awk '$2 == "tag" {print $1}' "$types" > "$tags"
+# The pushed refs themselves: an annotated tag object is what `git push v1.0`
+# publishes, and its message is written by hand exactly like a commit message.
+for sha in $shas; do
+  t=$(git cat-file -t "$sha" 2>/dev/null || true)
+  [ "$t" = "tag" ] && echo "$sha" >> "$tags"
+done
 
 # SAY what was skipped: "scanned everything under 1 MiB" is a different promise
 # from "scanned everything", and only the second one is worth staying silent about.
-oversize=$(awk '{print $1}' "$objects" \
-  | git cat-file --batch-check='%(objecttype) %(objectsize)' 2>/dev/null \
-  | awk -v max="$max_blob_bytes" '$1 == "blob" && $2 > max' | wc -l | tr -d ' ')
+oversize=$(awk -v max="$max_blob_bytes" '$2 == "blob" && $3 > max' "$types" | wc -l | tr -d ' ')
 if [ "${oversize:-0}" -gt 0 ]; then
   echo "pre-push: NOTE — $oversize blob(s) over $max_blob_bytes bytes were NOT scanned"
 fi
@@ -92,16 +121,32 @@ fi
 # 3) COMMIT MESSAGES. commit-msg catches new ones, but this hook also publishes
 # commits written before the guard existed. A token in a message is disclosed
 # exactly as typed and `git log` keeps it forever.
-# shellcheck disable=SC2086
+rc=0
 if [ -n "$excludes" ]; then
-  msgs=$(git log --format='%H%n%B%n' $shas --not $excludes 2>/dev/null || true)
+  # shellcheck disable=SC2086
+  msgs=$(git log --format='%H%n%B%n' $shas --not $excludes 2>"$tmpdir/err") || rc=$?
 else
-  msgs=$(git log --format='%H%n%B%n' $shas 2>/dev/null || true)
+  # shellcheck disable=SC2086
+  msgs=$(git log --format='%H%n%B%n' $shas 2>"$tmpdir/err") || rc=$?
 fi
+[ "$rc" -eq 0 ] || die "git log failed (rc=$rc): $(tr '\n' ' ' < "$tmpdir/err")"
 if [ -n "$msgs" ]; then
   if ! scan_text "an outgoing COMMIT MESSAGE" "$msgs"; then
     fail=1
   fi
+fi
+
+# 3b) TAG MESSAGES. Nothing looked at these at all: `-m` on `git tag -a` goes
+# through no hook whatsoever, and the text is published with the tag.
+if [ -s "$tags" ]; then
+  while read -r sha; do
+    [ -n "$sha" ] || continue
+    body=$(git cat-file tag "$sha" 2>/dev/null || true)
+    [ -n "$body" ] || die "could not read tag object $sha"
+    if ! scan_text "an outgoing TAG MESSAGE ($sha)" "$body"; then
+      fail=1
+    fi
+  done < "$tags"
 fi
 
 # 4) Fast path: one `cat-file --batch` stream through one grep, instead of two
@@ -115,7 +160,12 @@ fi
 # the shell this project is built and released from.
 pat="$tmpdir/patterns"
 : > "$pat"
-sp="$repo_root/.sanitize-patterns"
+# The shared resolver, not this worktree's root: in a linked `git worktree` the
+# untracked denylist lives with the MAIN checkout, so looking here found nothing
+# and the fast path never suspected anything — while scan_text, which resolves it
+# properly, was only reached if the generic pattern had already matched. A blob
+# carrying only a personal marker went out unexamined.
+sp=$(scan_denylist_path)
 if [ -f "$sp" ]; then
   # tr -d '\r': a CRLF-saved denylist would leave a trailing \r on every line
   # and silently match nothing.
@@ -140,8 +190,10 @@ if [ "$suspect" -ne 0 ]; then
   while read -r sha; do
     [ -n "$sha" ] || continue
     path=$(grep -m1 "^$sha " "$objects" | cut -d' ' -f2- || true)
-    # .githooks/ documents token FORMATS on purpose — same exclusion pre-commit makes.
-    case "$path" in .githooks/*) continue ;; esac
+    # Only _scan.sh, whose regex constants self-match the formats it defines —
+    # the same narrow exclusion pre-commit makes. Excluding all of .githooks/
+    # meant a concrete token pasted into a hook was published without a word.
+    case "$path" in .githooks/_scan.sh) continue ;; esac
     body=$(git cat-file blob "$sha" 2>/dev/null | tr -d '\000' || true)
     if ! scan_text "$path (blob $sha)" "$body"; then
       fail=1

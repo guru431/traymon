@@ -179,4 +179,135 @@ public sealed class ConfigTests : IDisposable
 		Assert.True(new Config().Save(out _));
 		Assert.False(File.Exists(Config.Path + ".tmp"));
 	}
+
+	/// <summary>
+	/// A pair with the red threshold below the yellow one used to load happily: the plate could
+	/// turn red while Score() refused to rank it at all, so the summary icon left it out.
+	/// </summary>
+	[Fact]
+	public void AnInvertedThresholdPairIsDropped()
+	{
+		File.WriteAllText(Config.Path, """{ "Icons": { "cpu": { "Warn": 90, "Crit": 70 } } }""");
+		var config = Config.Load();
+		Assert.NotNull(config.LoadError);
+		Assert.Null(config.Get("cpu").Warn);
+		Assert.Null(config.Get("cpu").Crit);
+	}
+
+	/// <summary>NaN and Infinity parse out of JSON and then compare false against everything.</summary>
+	[Fact]
+	public void NonFiniteThresholdsAreDropped()
+	{
+		File.WriteAllText(Config.Path, """{ "Icons": { "cpu": { "Warn": 1e400, "Crit": 1e401 } } }""");
+		var config = Config.Load();
+		Assert.Null(config.Get("cpu").Warn);
+		Assert.Null(config.Get("cpu").Crit);
+		Assert.False(Config.Sane(double.NaN));
+		Assert.False(Config.Sane(double.PositiveInfinity));
+		Assert.True(Config.Sane(null));
+		Assert.True(Config.Sane(70));
+	}
+
+	/// <summary>Gigabytes left: the red threshold is the lower number, so the check is reversed.</summary>
+	[Fact]
+	public void GigabyteThresholdsAreValidatedTheOtherWayRound()
+	{
+		File.WriteAllText(Config.Path, """{ "Icons": { "free.C:": { "WarnGb": 5, "CritGb": 50 } } }""");
+		var config = Config.Load();
+		Assert.Null(config.Get("free.C:").WarnGb);
+
+		File.WriteAllText(Config.Path, """{ "Icons": { "free.C:": { "WarnGb": 50, "CritGb": 5 } } }""");
+		config = Config.Load();
+		Assert.Null(config.LoadError);
+		Assert.Equal(50, config.Get("free.C:").WarnGb);
+		Assert.Equal(5, config.Get("free.C:").CritGb);
+	}
+
+	/// <summary>
+	/// Read() is what the watcher and "Перечитать настройки" use. It must not move the file aside:
+	/// an editor saves in more than one step, and an intermediate state used to cost the user their
+	/// file name and the previous backup with it.
+	/// </summary>
+	[Fact]
+	public void ReadDoesNotTouchABrokenFile()
+	{
+		File.WriteAllText(Config.Path, "{ half a file");
+		var config = Config.Read();
+		Assert.NotNull(config.LoadError);
+		Assert.True(File.Exists(Config.Path));
+		Assert.False(File.Exists(Config.Path + ".bad"));
+	}
+
+	/// <summary>The previous backup is not overwritten: two bad saves in a row used to leave only
+	/// the second broken file and nothing else.</summary>
+	[Fact]
+	public void AnExistingBackupIsKept()
+	{
+		File.WriteAllText(Config.Path + ".bad", "the good old settings");
+		File.WriteAllText(Config.Path, "{ broken again");
+		var config = Config.Load();
+		Assert.NotNull(config.LoadError);
+		Assert.Equal("the good old settings", File.ReadAllText(Config.Path + ".bad"));
+	}
+
+	/// <summary>Which tray identity each source holds has to survive a restart.</summary>
+	[Fact]
+	public void SlotAssignmentsRoundTrip()
+	{
+		var config = new Config();
+		var store = (IGuidStore)config;
+		var guid = new Guid("6f2a1c40-9d3b-4f7e-a1c2-7c9e5b000051");
+		store.Set("net", "Intel 2.5GbE", guid);
+		Assert.True(config.TakeSlotsChanged());
+		Assert.False(config.TakeSlotsChanged());
+		Assert.True(config.Save(out var error), error);
+
+		var read = (IGuidStore)Config.Load();
+		Assert.True(read.TryGet("net", "Intel 2.5GbE", out var back));
+		Assert.Equal(guid, back);
+		Assert.Equal("Intel 2.5GbE", read.OwnerOf("net", guid));
+	}
+
+	/// <summary>Renaming an id carries the settings over — two ids had to change to become stable.</summary>
+	[Fact]
+	public void RenameMovesTheEntry()
+	{
+		var config = new Config();
+		config.For("gpu.0").Color = "#112233";
+		Assert.True(config.Rename("gpu.0", "gpu.a1b2c3d4"));
+		Assert.Equal("#112233", config.Get("gpu.a1b2c3d4").Color);
+		Assert.Null(config.Get("gpu.0").Color);
+		// Nothing to move, and never over an entry that already exists.
+		Assert.False(config.Rename("gpu.0", "gpu.a1b2c3d4"));
+	}
+
+	[Fact]
+	public void TidyKeepsTheNewPerIconSettings()
+	{
+		var config = new Config();
+		config.For("fan.Nuvoton/Fan #2").Stall = "zero-ok";
+		config.Tidy("fan.Nuvoton/Fan #2");
+		Assert.Equal("zero-ok", config.Get("fan.Nuvoton/Fan #2").Stall);
+
+		config.For("ups").Required = true;
+		config.Tidy("ups");
+		Assert.True(config.Get("ups").Required);
+	}
+
+	[Fact]
+	public void SensorProfileAndLogLimitAreReadBack()
+	{
+		File.WriteAllText(Config.Path, """
+			{ "Sensors": { "UseSensorDriver": false },
+			  "Log": { "Enabled": true, "MaxMb": 4 },
+			  "Net": { "Include": ["vEthernet (LAN)"], "Bandwidth": { "Wi-Fi": 1200 } } }
+			""");
+		var config = Config.Load();
+		Assert.Null(config.LoadError);
+		Assert.False(config.Sensors.UseSensorDriver);
+		Assert.Equal(4, config.Log.MaxMb);
+		Assert.Equal(new[] { "vEthernet (LAN)" }, config.Net.Included);
+		Assert.Equal(1200, config.Net.BandwidthFor("Intel Wi-Fi 6E AX211"));
+		Assert.Null(config.Net.BandwidthFor("Realtek 2.5GbE"));
+	}
 }

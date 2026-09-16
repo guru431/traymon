@@ -22,7 +22,14 @@ public sealed class DiskSensor
 	private const uint FileShareRead = 1, FileShareWrite = 2;
 
 	private const uint StorageDeviceProperty = 0;
-	private const uint StorageDeviceTemperatureProperty = 77;
+
+	/// <summary>
+	/// 52, as ntddstor.h has it. It was 77 here, which is not a property id at all: the query
+	/// failed on every driver, so the icons were fed by the sensor library or by nothing — and the
+	/// second defect below, in the answer's layout, could never even be reached.
+	/// </summary>
+	private const uint StorageDeviceTemperatureProperty = 52;
+
 	private const uint PropertyStandardQuery = 0;
 
 	/// <summary>More than any machine this program is aimed at, and a bound on the probe loop.</summary>
@@ -69,11 +76,14 @@ public sealed class DiskSensor
 
 				var temp = Temperature(handle);
 				if (temp is null) continue;
-				var name = Model(handle) ?? "Диск " + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
-				// The same disk can appear twice behind a multipath or virtual controller.
-				if (!seen.Add(name + "|" + temp.Value.ToString("0", System.Globalization.CultureInfo.InvariantCulture) + "|" + i))
-					continue;
-				disks.Add(new DiskReading(name, temp.Value, null, null));
+				var (name, serial) = Describe(handle);
+				name ??= "Диск " + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
+				// The same disk can appear twice behind a multipath or virtual controller. By
+				// serial number where the driver gives one: the old key was
+				// "name|temperature|index", and the index made it unique on every iteration, so
+				// it deduplicated nothing at all.
+				if (!seen.Add(string.IsNullOrEmpty(serial) ? name + "|" + i : serial)) continue;
+				disks.Add(new DiskReading(name, temp.Value, null, null) { Serial = serial });
 			}
 			catch (Exception ex)
 			{
@@ -95,33 +105,38 @@ public sealed class DiskSensor
 		return disks;
 	}
 
+	/// <summary>
+	/// Composite temperature of the drive. The buffer is decoded by
+	/// <see cref="StorageTemperature"/>, which is checked against crafted answers rather than
+	/// against a disk — the layout was wrong here for a long time and nothing could see it.
+	/// </summary>
 	private static double? Temperature(IntPtr handle)
 	{
 		var output = new byte[512];
-		if (!Query(handle, StorageDeviceTemperatureProperty, output, out var returned)) return null;
-		// STORAGE_TEMPERATURE_DATA_DESCRIPTOR: Version, Size, CriticalTemperature,
-		// WarningTemperature, InfoCount, 2 reserved bytes, then InfoCount × STORAGE_TEMPERATURE_INFO.
-		const int header = 16, entry = 16;
-		if (returned < header + entry) return null;
-		var count = BitConverter.ToUInt16(output, 12);
-		if (count == 0) return null;
-		// Entry 0 is the composite temperature — the number every tool shows for the drive.
-		var celsius = BitConverter.ToInt16(output, header + 2);
-		// The driver reports SHRT_MIN for "not measured", and no disk is colder than -40 or
-		// hotter than 200 while it is still answering ioctls.
-		return celsius is > -40 and < 200 ? celsius : null;
+		return Query(handle, StorageDeviceTemperatureProperty, output, out var returned)
+			? StorageTemperature.Parse(output, returned)
+			: null;
 	}
 
-	private static string Model(IntPtr handle)
+	/// <summary>
+	/// Model and serial number of the drive. The serial is what tells two identical models apart
+	/// and what makes the multipath deduplication mean anything; a comment here used to claim the
+	/// query does not return one, which is not true — STORAGE_DEVICE_DESCRIPTOR carries
+	/// SerialNumberOffset next to the two it was already reading.
+	/// </summary>
+	private static (string Name, string Serial) Describe(IntPtr handle)
 	{
 		var output = new byte[1024];
-		if (!Query(handle, StorageDeviceProperty, output, out var returned) || returned < 36) return null;
-		// STORAGE_DEVICE_DESCRIPTOR: VendorIdOffset at 12, ProductIdOffset at 16 — both offsets
-		// into this same buffer, or 0 when the driver did not supply the string.
+		if (!Query(handle, StorageDeviceProperty, output, out var returned) || returned < 36) return (null, null);
+		// STORAGE_DEVICE_DESCRIPTOR: VendorIdOffset at 12, ProductIdOffset at 16,
+		// ProductRevisionOffset at 20, SerialNumberOffset at 24 — all offsets into this same
+		// buffer, or 0 when the driver did not supply the string.
 		var vendor = AnsiAt(output, BitConverter.ToInt32(output, 12), returned);
 		var product = AnsiAt(output, BitConverter.ToInt32(output, 16), returned);
+		var serial = AnsiAt(output, BitConverter.ToInt32(output, 24), returned);
 		var name = string.Join(' ', new[] { vendor, product }.Where(s => !string.IsNullOrWhiteSpace(s))).Trim();
-		return string.IsNullOrWhiteSpace(name) ? null : name;
+		return (string.IsNullOrWhiteSpace(name) ? null : name,
+				string.IsNullOrWhiteSpace(serial) ? null : serial);
 	}
 
 	private static string AnsiAt(byte[] buffer, int offset, int limit)

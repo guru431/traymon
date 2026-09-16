@@ -142,8 +142,6 @@ public sealed class TrayValueIcon : IDisposable
 	private readonly Action<TrayValueIcon> _onRightClick;
 	private readonly Action<TrayValueIcon> _onLeftClick;
 	private readonly Guid _guid;
-	private double _warn;
-	private double _crit;
 	private Color _plate;
 
 	private Color? _ink;
@@ -155,8 +153,8 @@ public sealed class TrayValueIcon : IDisposable
 	private string _lastText;
 	private string _lastTip = "";
 	private string _lastDrawn;
-	private double? _lastSeverity;
 	private Color _lastColor;
+	private int _lastLevel = int.MinValue;
 	private IntPtr _iconHandle = IntPtr.Zero;
 
 	private bool _forceRedraw;
@@ -178,11 +176,10 @@ public sealed class TrayValueIcon : IDisposable
 	/// <param name="plate">Background colour that identifies this metric.</param>
 	/// <param name="guid">Stable per-icon identity; must not change between runs, or the
 	/// icon loses the position the user dragged it to.</param>
-	/// <param name="warn">Severity value (not the drawn number) that turns the plate yellow.</param>
-	/// <param name="crit">Severity value that turns the plate red.</param>
 	/// <param name="ink">Digit colour, or null to pick it by the brightness of the plate.</param>
 	/// <param name="text">First number to draw, so the icon reaches the shell exactly once.</param>
-	/// <param name="severity">Severity of that first number.</param>
+	/// <param name="level">Alert level of that first number: -1 no data, 0 normal, 1 yellow,
+	/// 2 red. Decided by the owner, not here — see <see cref="Alarm"/>.</param>
 	/// <param name="tooltip">First tooltip.</param>
 	/// <remarks>
 	/// The icon is created ready. It used to be born as a grey dash, register itself, and then be
@@ -192,20 +189,17 @@ public sealed class TrayValueIcon : IDisposable
 	/// is passed in and the first Update is the only NIM_ADD.
 	/// </remarks>
 	public TrayValueIcon(Action<TrayValueIcon> onRightClick, Action<TrayValueIcon> onLeftClick,
-						 Color plate, Guid guid, double warn, double crit,
-						 Color? ink = null, string text = null, double? severity = null,
-						 string tooltip = "запуск…")
+						 Color plate, Guid guid, Color? ink = null, string text = null,
+						 int level = Alarm.Dead, string tooltip = "запуск…")
 	{
 		_onRightClick = onRightClick;
 		_onLeftClick = onLeftClick;
 		_plate = plate;
 		_guid = guid;
-		_warn = warn;
-		_crit = crit;
 		_ink = ink;
 		_useGuid = !NoGuids;
 		_window = new MessageWindow(this);
-		Update(text, severity, tooltip);
+		Update(text, level, tooltip);
 	}
 
 	/// <summary>Changes the plate colour and repaints immediately.</summary>
@@ -214,7 +208,7 @@ public sealed class TrayValueIcon : IDisposable
 		if (_plate == plate) return;
 		_plate = plate;
 		_forceRedraw = true;
-		Update(_lastDrawn, _lastSeverity, _lastTip);
+		Update(_lastDrawn, _level, _lastTip);
 	}
 
 	/// <summary>
@@ -226,54 +220,27 @@ public sealed class TrayValueIcon : IDisposable
 		if (_ink == ink) return;
 		_ink = ink;
 		_forceRedraw = true;
-		Update(_lastDrawn, _lastSeverity, _lastTip);
-	}
-
-	/// <summary>Changes the thresholds and repaints immediately.</summary>
-	public void SetThresholds(double warn, double crit)
-	{
-		if (Math.Abs(_warn - warn) < 0.001 && Math.Abs(_crit - crit) < 0.001) return;
-		_warn = warn;
-		_crit = crit;
-		_forceRedraw = true;
-		Update(_lastDrawn, _lastSeverity, _lastTip);
+		Update(_lastDrawn, _level, _lastTip);
 	}
 
 	/// <summary>True when the plate currently shows a threshold colour instead of its own.</summary>
-	public bool IsAlerting => _level >= 1;
+	public bool IsAlerting => _level >= Alarm.Warning;
 
-	/// <summary>-1 dead, 0 own colour, 1 warning, 2 critical. Kept between updates for the
-	/// hysteresis in <see cref="LevelOf"/>.</summary>
-	private int _level;
+	/// <summary>True when the shell has actually accepted this icon. "The object exists" is not
+	/// the same thing: a busy or refusing shell leaves an icon that carries no menu and shows
+	/// nothing, and the rules about never hiding the last one have to ask about the shell.</summary>
+	public bool Registered => _added;
 
-	/// <summary>
-	/// Which plate this severity calls for, rising immediately and falling only once the value
-	/// has cleared the threshold by a margin.
-	///
-	/// Without the margin a CPU sitting at 69-71 % against a threshold of 70 repainted the icon
-	/// and called into the shell on every single tick, alternating yellow and violet — the exact
-	/// cost the whole project spends its coarse numbers to avoid, reintroduced through the colour.
-	/// Three per cent of the critical threshold is below anything a person would notice and above
-	/// the jitter of every metric here.
-	/// </summary>
-	private int LevelOf(double? severity)
-	{
-		if (severity is null) return -1;
-		var s = severity.Value;
-		var margin = Math.Max(0.5, 0.03 * Math.Max(1, _crit));
-		if (s >= _crit) return 2;
-		if (s >= _warn) return _level == 2 && s >= _crit - margin ? 2 : 1;
-		if (s >= _warn - margin && _level >= 1) return 1;
-		return 0;
-	}
+	/// <summary>-1 dead, 0 own colour, 1 warning, 2 critical — as decided by the owner.</summary>
+	private int _level = Alarm.Dead;
 
 	/// <param name="text">What to draw, null when the source is unavailable.</param>
-	/// <param name="severity">Value the thresholds apply to — a percentage or a temperature,
-	/// which is not always what is drawn (the RAM icon shows GB but colours by percent).</param>
-	public void Update(string text, double? severity, string tooltip)
+	/// <param name="level">Alert level from <see cref="Alarm.LevelOf"/>. The hysteresis and the
+	/// "highlighting switched off" flag live there, so the plate, the journal, the notification
+	/// and the summary icon cannot disagree about the colour any more.</param>
+	public void Update(string text, int level, string tooltip)
 	{
 		_lastDrawn = text;
-		_lastSeverity = severity;
 		text ??= "—";
 		tooltip ??= "";
 
@@ -285,12 +252,22 @@ public sealed class TrayValueIcon : IDisposable
 			_checkSize = false;
 			if (Math.Max(16, SystemInformation.SmallIconSize.Height) != _side) _forceRedraw = true;
 		}
-		_level = LevelOf(severity);
-		var color = _level switch { -1 => DeadPlate, 2 => CritPlate, 1 => WarnPlate, _ => _plate };
+		_level = level;
+		var color = _level switch
+		{
+			Alarm.Critical => CritPlate,
+			Alarm.Warning => WarnPlate,
+			Alarm.Normal => _plate,
+			_ => DeadPlate,
+		};
 
 		if (tooltip.Length > TipLimit) tooltip = tooltip.Substring(0, TipLimit);
 
-		var visualChanged = text != _lastText || color != _lastColor;
+		// The level is part of the key, not only the colour it produces. The corner notches are
+		// drawn from it, and a user who picks the warning or critical RGB as an ordinary plate
+		// would otherwise get a healthy metric wearing the alarm shape — and a real transition
+		// with the same number and the same RGB would be deduplicated away.
+		var visualChanged = text != _lastText || color != _lastColor || _level != _lastLevel;
 		var tipChanged = tooltip != _lastTip;
 		if (_added && !visualChanged && !tipChanged && !_forceRedraw) return;
 
@@ -300,10 +277,11 @@ public sealed class TrayValueIcon : IDisposable
 		{
 			_forceRedraw = false;
 			var previous = _iconHandle;
-			_iconHandle = Render(text, color);
+			_iconHandle = Render(text, color, _level);
 			if (previous != IntPtr.Zero) DestroyIcon(previous);
 			_lastText = text;
 			_lastColor = color;
+			_lastLevel = _level;
 			_tipPending = false;
 			Send(_added ? NIM_MODIFY : NIM_ADD);
 			return;
@@ -469,7 +447,7 @@ public sealed class TrayValueIcon : IDisposable
 		_timeouts = 0;
 		_retryAt = 0;
 		_forceRedraw = true;
-		Update(_lastDrawn, _lastSeverity, _lastTip);
+		Update(_lastDrawn, _level, _lastTip);
 	}
 
 	/// <summary>
@@ -495,7 +473,7 @@ public sealed class TrayValueIcon : IDisposable
 		Trimming = StringTrimming.None,
 	};
 
-	private IntPtr Render(string text, Color plate)
+	private IntPtr Render(string text, Color plate, int level)
 	{
 		Interlocked.Increment(ref Renders);
 
@@ -518,16 +496,21 @@ public sealed class TrayValueIcon : IDisposable
 		var ink = _ink ?? (Luma(plate) > 140 ? Color.Black : Color.White);
 		var brush = Ink(ink);
 
-		// A second channel for the alarm. Colour alone loses to deuteranopia — the fan, the
-		// critical and the temperature plates collapse into one hue — and to a bad panel.
-		if (plate == CritPlate) { Notch(g, brush, side, topRight: true); Notch(g, brush, side, topRight: false); }
-		else if (plate == WarnPlate) Notch(g, brush, side, topRight: true);
+		// A second channel for the alarm, driven by the level and not by the RGB that came out of
+		// it. Colour alone loses to deuteranopia — the fan, the critical and the temperature
+		// plates collapse into one hue — and to a bad panel; matching on the plate colour also
+		// put the alarm shape on a healthy metric whose own colour happened to be that RGB.
+		if (level >= Alarm.Critical) { Notch(g, brush, side, topRight: true); Notch(g, brush, side, topRight: false); }
+		else if (level == Alarm.Warning) Notch(g, brush, side, topRight: true);
 
 		g.SmoothingMode = SmoothingMode.None;
 		g.TextRenderingHint = TextRenderingHint.SingleBitPerPixelGridFit;
 		// Four digits are a normal reading, not an edge case: a 2.5 GbE link carrying a file
-		// copy shows 1200 Mbit/s, so there is a step for them too.
-		var step = text.Length > 3 ? 2 : text.Length > 2 ? 1 : 0;
+		// copy shows 1200 Mbit/s, so there is a step for them too. Five is not supposed to
+		// happen — the families that can reach 10000 switch to a bigger unit and say so in their
+		// caption — but a step for it beats the previous behaviour, which drew the number off
+		// both edges of the plate and lost the first digit as well as the last.
+		var step = text.Length > 4 ? 3 : text.Length > 3 ? 2 : text.Length > 2 ? 1 : 0;
 		g.DrawString(text, Digit(side, step), brush, new RectangleF(0, 0, side, side), Centered);
 
 		return _canvas.GetHicon();
@@ -558,7 +541,7 @@ public sealed class TrayValueIcon : IDisposable
 	{
 		var key = (side, step);
 		if (Digits.TryGetValue(key, out var font)) return font;
-		var factor = step switch { 2 => 0.44f, 1 => 0.56f, _ => 0.72f };
+		var factor = step switch { 3 => 0.35f, 2 => 0.44f, 1 => 0.56f, _ => 0.72f };
 		return Digits[key] = new Font("Segoe UI", side * factor, FontStyle.Bold, GraphicsUnit.Pixel);
 	}
 

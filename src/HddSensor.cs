@@ -30,9 +30,19 @@ public sealed class HddSensor
 	/// <summary>One device answers in about 100 ms; ten seconds means it is not going to.</summary>
 	private const int RunTimeoutMs = 10000;
 
+	/// <summary>
+	/// How long a discovered device list is trusted. It used to be kept for the lifetime of the
+	/// process and dropped only when *nothing* answered, so a disk added or moved to another port
+	/// while one healthy disk kept answering was never noticed — and "Опросить датчики сейчас" did
+	/// not clear it either. A scan costs one more smartctl run, so it is rare rather than free.
+	/// </summary>
+	private const long RediscoverAfterMs = 60L * 60 * 1000;
+
 	private readonly string _exe;
 	private readonly string _scanArgs;
-	private List<(string Device, string Type)> _devices;   // discovered once; ports do not move while Windows runs
+	private List<(string Device, string Type)> _devices;
+	private long _discoveredAt;
+	private bool? _safe;
 
 	/// <summary>Why the last run failed, if it did; shown by the diagnostics window.</summary>
 	public string LastError { get; private set; }
@@ -70,7 +80,16 @@ public sealed class HddSensor
 			return disks;
 		}
 
-		_devices ??= Discover();
+		// Where this runs from is checked once, not because of the icons but because of the token:
+		// TrayMon holds an elevated one, the path comes out of a file the user can edit, and
+		// CreateProcess would happily start whatever is sitting there.
+		if (!Safe()) return disks;
+
+		if (_devices is null || Environment.TickCount64 - _discoveredAt > RediscoverAfterMs)
+		{
+			_devices = Discover();
+			_discoveredAt = Environment.TickCount64;
+		}
 		var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
 		foreach (var (device, type) in _devices)
@@ -85,20 +104,47 @@ public sealed class HddSensor
 
 			var root = json.RootElement;
 			var temp = Nested(root, "temperature", "current");
-			if (temp is null) continue;
+			var health = Health(root);
+			// Health without a temperature is still an answer, and the most important one there
+			// is: a disk in standby, or one whose firmware reports no temperature, used to be
+			// dropped here — before the SMART verdict was even looked at — so a failing disk
+			// produced no icon, no red plate and no event.
+			if (temp is null && health.Length == 0) continue;
 
 			var serial = Text(root, "serial_number") ?? "";
 			var key = serial.Length > 0 ? serial : device;
 			if (!seen.Add(key)) continue;   // same disk answering on another port
 
 			var name = Text(root, "model_name") ?? Text(root, "device_model") ?? "RAID disk";
-			disks.Add(new RaidDisk(name.Trim(), temp.Value, serial, Health(root)));
+			disks.Add(new RaidDisk(name.Trim(), temp, serial, health));
 		}
 
 		// Nothing answered: the controller or the disks changed, so look again next time.
 		if (disks.Count == 0) _devices = null;
 		else LastError = null;
 		return disks;
+	}
+
+	/// <summary>
+	/// Forgets the device list, so the next read scans again. "Опросить датчики сейчас" exists for
+	/// the moment right after the hardware changed, which is exactly when a cached list is wrong.
+	/// </summary>
+	public void Rediscover() => _devices = null;
+
+	/// <summary>
+	/// Whether this smartctl may be started at all. The path is configurable and this process runs
+	/// elevated, so a copy in a folder an ordinary process can write to is a way to have anything
+	/// executed with an administrator token — the same argument that already refuses to create the
+	/// autostart task from such a folder. Checked once; an ACL is not free and does not move.
+	/// </summary>
+	private bool Safe()
+	{
+		if (_safe.HasValue) return _safe.Value;
+		_safe = !Autostart.UnsafeToRun(_exe, out var who);
+		if (_safe == false)
+			LastError = "smartctl.exe не запущен: его может подменить " + who +
+						", а TrayMon работает с правами администратора";
+		return _safe.Value;
 	}
 
 	/// <summary>True when the disk reported anything other than a clean bill of health.</summary>

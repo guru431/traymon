@@ -19,6 +19,26 @@ scan_generic_pattern() {
   printf '%s' '-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{16,}|gsk_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35}|ccr-[A-Za-z0-9]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+|[0-9]{8,10}:[A-Za-z0-9_-]{35}|user_[A-Za-z0-9]{20,}'
 }
 
+# Where the personal denylist lives, in ONE place: pre-push used to resolve it
+# on its own with `--show-toplevel`, which points at a linked worktree — where
+# this untracked, gitignored file does not exist — so a blob carrying only a
+# personal marker could be pushed from a worktree with the check silently
+# skipped, while `scan_text` looked in the right place. Two resolvers, two
+# answers, and the difference decided whether a secret was published.
+# Prints the path (which may not exist) on stdout.
+scan_denylist_path() {
+  scan_common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  if [ -n "$scan_common" ]; then
+    scan_sp="$(dirname "$scan_common")/.sanitize-patterns"
+  else
+    scan_sp="$(git rev-parse --show-toplevel)/.sanitize-patterns"
+  fi
+  if [ ! -f "$scan_sp" ] && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/traymon/sanitize-patterns" ]; then
+    scan_sp="${XDG_CONFIG_HOME:-$HOME/.config}/traymon/sanitize-patterns"
+  fi
+  printf '%s' "$scan_sp"
+}
+
 # scan_text <label> <text> -> 0 clean, 1 blocked
 scan_text() {
   scan_label=$1
@@ -38,22 +58,10 @@ scan_text() {
   # such line and, on Git Bash, abort grep outright (rc=134) instead of
   # reporting anything. A scanner error (grep rc>1) fails closed, so a broken
   # regex in the file blocks the commit rather than silently passing it.
-  # The MAIN worktree's root, not this worktree's. `--show-toplevel` in a
-  # `git worktree` (superpowers using-git-worktrees, Agent isolation:
-  # "worktree") points at the linked checkout, where this untracked, gitignored
-  # file does not exist — so the entire internal-hosts / IP / personal-data
-  # class silently went unchecked, and CI cannot cover it either (gitleaks has
-  # no access to the denylist). Fall back to a shared user-level copy, and if
+  # The MAIN worktree's root, not this worktree's — see scan_denylist_path,
+  # which both hooks now share. Fall back to a shared user-level copy, and if
   # there is none, SAY so instead of skipping in silence.
-  scan_common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
-  if [ -n "$scan_common" ]; then
-    scan_sp="$(dirname "$scan_common")/.sanitize-patterns"
-  else
-    scan_sp="$(git rev-parse --show-toplevel)/.sanitize-patterns"
-  fi
-  if [ ! -f "$scan_sp" ] && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/traymon/sanitize-patterns" ]; then
-    scan_sp="${XDG_CONFIG_HOME:-$HOME/.config}/traymon/sanitize-patterns"
-  fi
+  scan_sp=$(scan_denylist_path)
   if [ ! -f "$scan_sp" ]; then
     echo "WARN: .sanitize-patterns not found (looked in $scan_sp) — the personal-data check is SKIPPED."
   fi
