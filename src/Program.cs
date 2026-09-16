@@ -205,7 +205,8 @@ internal static class Program
 		var loose = Autostart.InstallUnsafe(config.Tools?.Smartctl, out _);
 		Say($"install folder: {(loose ? "WRITABLE by a non-administrator — do not enable autostart from here" : Autostart.LastCheckError is not null ? "permissions not readable — " + Autostart.LastCheckError : "writable by administrators only")}");
 		Say($"settings file:  TrayMon.json {(File.Exists(Config.Path) ? "found" : "absent, defaults in use")}" +
-			$"{(config.LoadError is null ? "" : " — " + config.LoadError)}");
+			$"{(config.LoadError is null ? "" : " — " + config.LoadError)}" +
+			$"{(config.LoadNote is null ? "" : " — " + config.LoadNote)}");
 		Say("cost, ms (cold / warm):");
 		foreach (var source in cold.Keys)
 			Say($"                {source,-14} {cold[source].ToString("0.0", ci).PadLeft(7)} / " +
@@ -401,7 +402,7 @@ internal sealed class TrayApp : ApplicationContext
 	private const long RetryDeadSourceMs = 5 * 60 * 1000;
 
 	/// <summary>Thresholds high enough that no reading reaches them — the "never alarms" metric state.</summary>
-	private const double NeverAlerts = 1e9;
+	private const double NeverAlerts = Alarm.Never;
 
 	// Built-in plate colours: one per metric family, so icons are told apart without reading them.
 	// No two are alike — GPU and "CPU temperature" used to be the same maroon down to the byte,
@@ -1103,7 +1104,10 @@ internal sealed class TrayApp : ApplicationContext
 		Housekeeping();
 		// Losing every colour, label and threshold is not something to mention only to
 		// someone who thinks to open the diagnostics window. On the second tick, for the same
-		// reason as above.
+		// reason as above. Only a file that could not be read at all gets this dialog: a value
+		// that had to be adjusted is a note for the diagnostics window, and announcing it as
+		// "файл не прочитан, взяты значения по умолчанию" was a lie about a file that had been
+		// read and applied.
 		if (_tick == 2 && !_dry && _config.LoadError is not null)
 			Later($"Файл настроек не прочитан, взяты значения по умолчанию:\n\n{_config.LoadError}",
 				MessageBoxIcon.Warning);
@@ -2184,7 +2188,7 @@ internal sealed class TrayApp : ApplicationContext
 
 		// The pools hand out a tray identity the first time they see a device, and that assignment
 		// has to outlive the process or the next start gives it to somebody else.
-		if (_config.TakeSlotsChanged()) _configDirty = true;
+		if (_config.TakeDirty()) _configDirty = true;
 
 		// Written on a schedule, not on every tick: a settings file is the one thing here that
 		// touches the disk regularly. The flag is cleared only on success — clearing it regardless
@@ -3304,6 +3308,7 @@ internal sealed class TrayApp : ApplicationContext
 		text.AppendLine();
 		text.AppendLine($"файл настроек:    {Config.Path}");
 		if (_config.LoadError is not null) text.AppendLine($"                  {_config.LoadError}");
+		if (_config.LoadNote is not null) text.AppendLine($"                  {_config.LoadNote}");
 		if (_config.ChangedOnDisk) text.AppendLine("                  файл изменён на диске — «Перечитать настройки»");
 		text.AppendLine($"автозапуск:       {(Autostart.IsEnabled ? "включён" : "выключен")}");
 		if (Autostart.PointsElsewhere(out var command))

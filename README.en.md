@@ -217,7 +217,14 @@ Per-icon fields: `Enabled`, `Color`, `Label`, `Ink`, `Warn`, `Crit`, `Alerts`, `
 switches threshold colouring off without touching the thresholds. Unusable values (`NaN`,
 `Infinity`, a red threshold on the wrong side of the yellow one) are dropped on load and reported
 in the diagnostics window; such a pair used to load in silence and paint a red plate the summary
-icon refused to rank.
+icon refused to rank. That is a **note, not a refusal to read the file** — everything else in it
+still applies, and the "could not be read" dialog is reserved for a file that really did not parse.
+
+**Files from older versions are migrated, not rejected.** Before `Alerts` existed, a switched-off
+highlight was written as `"Warn": 1000000000, "Crit": 1000000000`, and such files are still around.
+That pair is an instruction, not junk: it is read as `"Alerts": false` and the file is rewritten in
+the current spelling on the next save. Dropping it would switch the highlight back on for icons
+somebody had deliberately silenced.
 
 - `TickMs` — the **drawing** interval, upwards only: anything below 2000 is refused. Measurement
   periods are separate and in seconds, so raising it makes the program cheaper without pushing

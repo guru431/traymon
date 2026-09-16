@@ -319,9 +319,19 @@ public sealed class Config : IGuidStore
 	[JsonIgnore]
 	public static string Path => System.IO.Path.Combine(AppContext.BaseDirectory, "TrayMon.json");
 
-	/// <summary>What went wrong while loading, if anything; shown by --once and by the menu.</summary>
+	/// <summary>
+	/// The file could not be read at all — everything is at its defaults. Kept strictly apart from
+	/// <see cref="LoadNote"/>: this one makes the program refuse to apply a reload and announce
+	/// that every colour, label and threshold has been lost, and saying that about a file whose
+	/// only sin was one impossible number is both false and frightening.
+	/// </summary>
 	[JsonIgnore]
 	public string LoadError { get; private set; }
+
+	/// <summary>The file was read, but something in it had to be adjusted or ignored. Shown by
+	/// <c>--once</c> and in the diagnostics window; never a dialog.</summary>
+	[JsonIgnore]
+	public string LoadNote { get; private set; }
 
 	/// <summary>Write time of the file this object was read from, so an edit made behind our
 	/// back can be noticed instead of being silently overwritten.</summary>
@@ -373,7 +383,7 @@ public sealed class Config : IGuidStore
 					config.Icons[key] = new IconSettings();
 				foreach (var key in config.Slots.Where(p => p.Value is null).Select(p => p.Key).ToList())
 					config.Slots[key] = new Dictionary<string, string>(StringComparer.Ordinal);
-				config.LoadError = config.Validate();
+				config.LoadNote = config.Validate();
 				config.Stamp = File.GetLastWriteTimeUtc(Path);
 				return config;
 			}
@@ -411,6 +421,20 @@ public sealed class Config : IGuidStore
 		foreach (var (id, s) in Icons)
 		{
 			if (s is null) continue;
+
+			// The old spelling of "highlight off": before Alerts existed, the menu wrote the
+			// unreachable constant into both thresholds, and files written by those versions still
+			// carry it. It is not a broken value — it is an instruction, and throwing it away
+			// switched the highlight back *on* for icons somebody had deliberately silenced.
+			if (s.Warn >= Alarm.Never && s.Crit >= Alarm.Never)
+			{
+				s.Alerts ??= false;
+				s.Warn = null;
+				s.Crit = null;
+				_dirty = true;   // rewrite the file in the current spelling when it is next saved
+				continue;
+			}
+
 			if (!Sane(s.Warn) || !Sane(s.Crit) || (s.Warn.HasValue && s.Crit.HasValue && s.Warn >= s.Crit))
 			{
 				if (s.Warn.HasValue || s.Crit.HasValue) dropped.Add(id + ": пороги");
@@ -427,7 +451,8 @@ public sealed class Config : IGuidStore
 		}
 		return dropped.Count == 0
 			? null
-			: "непригодные значения в файле пропущены (" + string.Join(", ", dropped) + ")";
+			: "файл прочитан, но непригодные значения пропущены (" + string.Join(", ", dropped) +
+			  ") — остальные настройки взяты из файла";
 	}
 
 	/// <summary>A threshold has to be a finite number in a range a metric can reach.</summary>
@@ -559,7 +584,7 @@ public sealed class Config : IGuidStore
 		if (table.TryGetValue(key, out var was) && string.Equals(was, guid.ToString(), StringComparison.OrdinalIgnoreCase))
 			return;
 		table[key] = guid.ToString();
-		_slotsChanged = true;
+		_dirty = true;
 	}
 
 	void IGuidStore.Remove(string pool, string key)
@@ -567,20 +592,21 @@ public sealed class Config : IGuidStore
 		var table = Pool(pool, create: false);
 		if (table is null || !table.Remove(key)) return;
 		if (table.Count == 0) Slots.Remove(pool);   // an empty section is noise in a file people read
-		_slotsChanged = true;
+		_dirty = true;
 	}
 
-	private bool _slotsChanged;
+	private bool _dirty;
 
 	/// <summary>
-	/// True once since the last call: the pools have handed out or given back an identity, so the
-	/// file is behind. Reported rather than saved on the spot — the caller owns when the disk is
-	/// touched, and a settings file is the one thing here that writes on a schedule.
+	/// True once since the last call: this object differs from the file — a pool has handed out or
+	/// given back an identity, or a setting written in an older spelling has been migrated.
+	/// Reported rather than saved on the spot; the caller owns when the disk is touched, and a
+	/// settings file is the one thing here that writes on a schedule.
 	/// </summary>
-	public bool TakeSlotsChanged()
+	public bool TakeDirty()
 	{
-		var changed = _slotsChanged;
-		_slotsChanged = false;
+		var changed = _dirty;
+		_dirty = false;
 		return changed;
 	}
 }

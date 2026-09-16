@@ -177,6 +177,13 @@ internal static class Alarm
 	public const int Dead = -1, Normal = 0, Warning = 1, Critical = 2;
 
 	/// <summary>
+	/// A threshold no reading can reach — "this metric never alarms". Also the spelling the
+	/// settings file used for a switched-off highlight before <c>Alerts</c> existed, which is why
+	/// <see cref="Config"/> has to recognise it rather than treat it as a broken number.
+	/// </summary>
+	public const double Never = 1e9;
+
+	/// <summary>
 	/// The level this severity calls for, rising at once and falling only once the value has
 	/// cleared the threshold by a margin. Without the margin a CPU sitting at 69-71 % against a
 	/// threshold of 70 repainted the icon and called into the shell on every single tick — the

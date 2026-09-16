@@ -187,11 +187,56 @@ public sealed class ConfigTests : IDisposable
 	[Fact]
 	public void AnInvertedThresholdPairIsDropped()
 	{
-		File.WriteAllText(Config.Path, """{ "Icons": { "cpu": { "Warn": 90, "Crit": 70 } } }""");
+		File.WriteAllText(Config.Path, """{ "Icons": { "cpu": { "Color": "#112233", "Warn": 90, "Crit": 70 } } }""");
 		var config = Config.Load();
-		Assert.NotNull(config.LoadError);
+		// A note, not an error: the file *was* read, and saying otherwise made the startup dialog
+		// announce that every colour and threshold had been lost — and made a reload refuse to
+		// apply a file whose only sin was one impossible pair.
+		Assert.Null(config.LoadError);
+		Assert.NotNull(config.LoadNote);
 		Assert.Null(config.Get("cpu").Warn);
 		Assert.Null(config.Get("cpu").Crit);
+		Assert.Equal("#112233", config.Get("cpu").Color);
+	}
+
+	/// <summary>
+	/// The regression that hit a live machine: before <c>Alerts</c> existed, switching the
+	/// highlight off was written as <c>Warn = Crit = 1e9</c>, and files from those versions still
+	/// carry it. Treating it as a broken value dropped it — which switched the highlight back *on*
+	/// for four icons somebody had deliberately silenced, and threw the setting out of their file.
+	/// </summary>
+	[Fact]
+	public void TheOldWayOfSwitchingTheHighlightOffIsMigratedNotDropped()
+	{
+		File.WriteAllText(Config.Path, """
+			{ "Icons": {
+			    "cpu":  { "Enabled": true, "Color": "#8000FF", "Warn": 1000000000, "Crit": 1000000000 },
+			    "gpu.0": { "Enabled": true, "Warn": 1e9, "Crit": 1e9 } } }
+			""");
+		var config = Config.Load();
+
+		Assert.Null(config.LoadError);
+		Assert.Null(config.LoadNote);          // nothing to complain about — it was an instruction
+		foreach (var id in new[] { "cpu", "gpu.0" })
+		{
+			Assert.False(config.Get(id).Alerts);   // the same meaning, in the current spelling
+			Assert.Null(config.Get(id).Warn);
+			Assert.Null(config.Get(id).Crit);
+		}
+		Assert.Equal("#8000FF", config.Get("cpu").Color);
+		// And the file is rewritten in the new spelling when it is next saved.
+		Assert.True(config.TakeDirty());
+	}
+
+	/// <summary>An explicit Alerts already in the file wins: migration must not overwrite it.</summary>
+	[Fact]
+	public void MigrationDoesNotOverrideAnExplicitAlertsFlag()
+	{
+		File.WriteAllText(Config.Path,
+			"""{ "Icons": { "cpu": { "Alerts": true, "Warn": 1000000000, "Crit": 1000000000 } } }""");
+		var config = Config.Load();
+		Assert.True(config.Get("cpu").Alerts);
+		Assert.Null(config.Get("cpu").Warn);
 	}
 
 	/// <summary>NaN and Infinity parse out of JSON and then compare false against everything.</summary>
@@ -214,11 +259,14 @@ public sealed class ConfigTests : IDisposable
 	{
 		File.WriteAllText(Config.Path, """{ "Icons": { "free.C:": { "WarnGb": 5, "CritGb": 50 } } }""");
 		var config = Config.Load();
+		Assert.Null(config.LoadError);
+		Assert.NotNull(config.LoadNote);
 		Assert.Null(config.Get("free.C:").WarnGb);
 
 		File.WriteAllText(Config.Path, """{ "Icons": { "free.C:": { "WarnGb": 50, "CritGb": 5 } } }""");
 		config = Config.Load();
 		Assert.Null(config.LoadError);
+		Assert.Null(config.LoadNote);
 		Assert.Equal(50, config.Get("free.C:").WarnGb);
 		Assert.Equal(5, config.Get("free.C:").CritGb);
 	}
@@ -258,8 +306,8 @@ public sealed class ConfigTests : IDisposable
 		var store = (IGuidStore)config;
 		var guid = new Guid("6f2a1c40-9d3b-4f7e-a1c2-7c9e5b000051");
 		store.Set("net", "Intel 2.5GbE", guid);
-		Assert.True(config.TakeSlotsChanged());
-		Assert.False(config.TakeSlotsChanged());
+		Assert.True(config.TakeDirty());
+		Assert.False(config.TakeDirty());
 		Assert.True(config.Save(out var error), error);
 
 		var read = (IGuidStore)Config.Load();
