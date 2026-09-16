@@ -11,7 +11,8 @@ hook_dir=$(dirname "$0")
 # shellcheck source=.githooks/_scan.sh
 . "$hook_dir/_scan.sh"
 
-repo_root=$(git rev-parse --show-toplevel)
+# No repo_root here: the denylist is resolved by scan_denylist_path in _scan.sh (it has to be
+# the MAIN worktree's, not this one's), and nothing else in this hook needs a path.
 fail=0
 
 # 1) Block sensitive filenames entering the tree (allow *.example templates).
