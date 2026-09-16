@@ -239,9 +239,12 @@ internal static class Program
 	{
 		var hide = new Redactor();
 		hide.Hide(config?.Ups?.Host, "<ups host>");
-		hide.Hide(Environment.UserName, "<user>");
+		// Not the built-in names. "Administrator" identifies nobody, and hiding it mangled the
+		// English text around it: the line about folder permissions came out as "WRITABLE by a
+		// non-<user>", which is both ugly and harder to act on.
+		if (!Generic(Environment.UserName)) hide.Hide(Environment.UserName, "<user>");
 		hide.Hide(Environment.MachineName, "<host>");
-		hide.Hide(Environment.UserDomainName, "<domain>");
+		if (!Generic(Environment.UserDomainName)) hide.Hide(Environment.UserDomainName, "<domain>");
 		hide.Hide(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "<profile>");
 		hide.Hide(AppContext.BaseDirectory.TrimEnd('\\'), "<app>");
 		hide.Hide(Environment.ProcessPath, "<app>\\TrayMon.exe");
@@ -249,6 +252,13 @@ internal static class Program
 		hide.Hide(config?.Log?.Path, "<log>");
 		return hide;
 	}
+
+	/// <summary>A built-in account or workgroup name: it names no person and is a word the rest of
+	/// the report uses in its ordinary sense.</summary>
+	private static bool Generic(string name) =>
+		name is not null &&
+		new[] { "administrator", "admin", "user", "guest", "system", "workgroup", "администратор", "пользователь" }
+			.Contains(name.Trim(), StringComparer.OrdinalIgnoreCase);
 
 	private static string SensorDriverLine(LhmSensor lhm) =>
 		lhm.Disabled ? "DISABLED — " + lhm.LastError
