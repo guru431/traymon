@@ -8,7 +8,7 @@
 - `src/Program.cs` — `--once`, `TrayApp`: тики, слоты иконок, меню, окна, форматирование
 - `src/Pure.cs` — `GuidPool`, `Stats`, `Alarm` (уровень тревоги), `Scale`, `Format`, `Csv`,
   `Redactor`, `StorageTemperature`: логика без железа, покрыта тестами
-- `src/TrayIcons.cs` — отрисовка и регистрация значков через `Shell_NotifyIcon`, гистерезис цвета
+- `src/TrayIcons.cs` — отрисовка и регистрация значков через `Shell_NotifyIcon`; порогов и гистерезиса не знает — уровень тревоги считает `Alarm.LevelOf` в `Pure.cs`
 - `src/PerfSensors.cs`, `src/Sensors.cs`, `src/DiskSensor.cs`, `src/HddSensor.cs`,
   `src/UpsSensor.cs` — источники данных
 - `src/WindowsLog.cs` — критические переходы в журнал приложений Windows
