@@ -46,7 +46,11 @@ public sealed record DiskReading(string Name, double Temp, double? WearPercent, 
 public sealed class BatteryReading
 {
 	public double Charge;          // % of capacity
-	public bool OnBattery;         // mains unplugged
+	/// <summary>Mains unplugged. Null when Windows answers <c>ACLineStatus = 255</c>: that is
+	/// "not known", and reporting it as mains power is the same mistake
+	/// <see cref="UpsReading.OnBattery"/> exists to avoid — a green plate over a state nobody
+	/// measured.</summary>
+	public bool? OnBattery;
 	public double? MinutesLeft;    // null when Windows will not estimate
 }
 
@@ -261,7 +265,7 @@ public static class BatterySensor
 		r.Battery = new BatteryReading
 		{
 			Charge = s.BatteryLifePercent,
-			OnBattery = s.ACLineStatus == 0,
+			OnBattery = s.ACLineStatus switch { 0 => true, 1 => false, _ => null },
 			MinutesLeft = s.BatteryLifeTime >= 0 ? s.BatteryLifeTime / 60.0 : null,
 		};
 	}

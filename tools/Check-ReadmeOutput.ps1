@@ -43,9 +43,24 @@ function Get-Labels([string[]]$lines) {
         if ($text -match '^([^:]{1,30}):') { $label = $Matches[1] }
         else { $label = ($text -split '\s{2,}')[0] }
         $label = ($label -replace '\d+', 'N').Trim()
-        # Хвост значения без разделителя («uptime N.N h») — оставляем только первое слово,
-        # если после подписи всё равно остались числа.
-        if ($label -match '\sN') { $label = ($label -split '\s+')[0] }
+        # Хвост значения без разделителя («uptime N.N h», «GPU N mem N %») — снимаем ровно
+        # одно замыкающее «число (+ единица)». Прежнее «оставить первое слово» схлопывало
+        # `GPU N mem` и `GPU N fan` в тот же `GPU` — ровно то, что комментарий выше объявлял
+        # исправленным, — и расхождение состава GPU-строк не обнаруживалось вовсе.
+        $words = @($label -split '\s+')
+        if ($words.Count -gt 2 -and $words[-1] -notmatch '^N(\.N)?$' -and $words[-2] -match '^N(\.N)?$') {
+            $words = $words[0..($words.Count - 3)]   # число вместе с единицей измерения
+        }
+        if ($words.Count -gt 1 -and $words[-1] -match '^N(\.N)?$') {
+            $words = $words[0..($words.Count - 2)]
+        }
+        # Буква тома («volume   C:») — такой же машинно-зависимый хвост, как номер карты,
+        # и её тоже надо свести: иначе на машине с лишним томом скрипт сообщает о расхождении
+        # с README там, где расходится только железо.
+        if ($words.Count -gt 1 -and $words[-1] -match '^[^\W\d_]$') {
+            $words = $words[0..($words.Count - 2)]
+        }
+        $label = $words -join ' '
         if ($label) { $labels += $label }
     }
     $labels | Sort-Object -Unique
@@ -80,7 +95,7 @@ $stale = $fromDocs | Where-Object { $_ -notin $fromCode }
 # Строки, которых на конкретной машине может не быть: нет карты NVIDIA, нет ИБП, нет RAID,
 # нет батареи, запуск без прав администратора. Их отсутствие в выводе — не расхождение
 # с документом.
-$optional = @('GPU', 'GPU N', 'GPU N mem', 'GPU N fan', 'raid', 'ups', 'disk', 'fan', 'battery',
+$optional = @('GPU', 'GPU N mem', 'GPU N fan', 'raid', 'ups', 'disk', 'fan', 'battery',
               'ring-N device', 'ring-N')
 $stale = $stale | Where-Object { $_ -notin $optional }
 $missing = $missing | Where-Object { $_ -notin $optional }

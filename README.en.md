@@ -120,7 +120,10 @@ trimming or boosting the mains, and when the UPS asks for a new battery; it turn
 less than five minutes of runtime are left, whatever the charge gauge claims — and when the agent
 carries no charge OID at all, the icon shows "—" and still raises the alarm. The threshold dialog
 for such metrics asks for and shows **charge**, not the internal severity. A laptop battery's
-charge thresholds only apply while it is discharging: on the mains there is no highlight.
+charge thresholds only apply while it is discharging: on the mains there is no highlight. On the
+*known* mains, that is — when Windows answers "power state unknown", the charge thresholds do
+apply and the tooltip says so, because a green plate over a state nobody measured is the same
+mistake the UPS `unknown` status is kept apart from.
 
 **What a stopped fan means is a choice** ("При остановке"): any standstill is an alarm (the
 default), a legitimate zero-rpm mode is allowed (red only when the fan stands still while its

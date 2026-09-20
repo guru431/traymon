@@ -106,6 +106,29 @@ printf 'refs/tags/v0.0.1-test %s refs/tags/v0.0.1-test %s\n' "$tag" "$zero" \
   | ( cd "$repo" && sh "$hooks/pre-push" origin https://example.invalid/x.git ) >/dev/null 2>&1 || rc=$?
 check "pre-push: token in an annotated tag message is refused" 1 "$rc"
 
+# 8) Every LINE of .sanitize-patterns is its own pattern. `grep -Ef` reads the file that way,
+#    and the hook pipes it through `tr` first — one character away from deleting the newlines
+#    instead of the CRs and leaving a single pattern, the concatenation of all of them, that
+#    matches nothing. The hook would still report a completed check, which is how this was read
+#    as a live hole in review. CRLF on purpose: that is what the `tr` is there for.
+printf 'zaphod\\.example\\.invalid\r\nvogon-[0-9]{4}-serial\r\n' > "$repo/.sanitize-patterns"
+for marker in zaphod.example.invalid vogon-4242-serial; do
+  echo "host = $marker" > "$repo/c.txt"
+  git -C "$repo" add c.txt
+  rc=0
+  ( cd "$repo" && git commit -q -m "add c" ) >/dev/null 2>&1 || rc=$?
+  check "pre-commit: denylist line '$marker' matches on its own" 1 "$rc"
+  git -C "$repo" reset -q
+done
+
+# And a value that matches neither line still goes through, so the case above is the denylist
+# working rather than the hook refusing everything.
+echo "host = example.invalid" > "$repo/c.txt"
+git -C "$repo" add c.txt
+rc=0
+( cd "$repo" && git commit -q -m "add c" ) >/dev/null 2>&1 || rc=$?
+check "pre-commit: content matching no denylist line is accepted" 0 "$rc"
+
 rm -rf "$repo"
 echo ""
 echo "passed $passed, failed $failed"

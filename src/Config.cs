@@ -393,7 +393,7 @@ public sealed class Config : IGuidStore
 			// A broken file must not keep the program from starting — but it must not be thrown
 			// away in silence either: the first change from the menu would overwrite hand-made
 			// colours, labels and the UPS address with defaults, with nothing said about it.
-			return new Config { LoadError = recover ? Keep(ex) : Describe(ex) + " — файл не тронут" };
+			return Stamped(new Config { LoadError = recover ? Keep(ex) : Describe(ex) + " — файл не тронут" });
 		}
 		catch (Exception ex)
 		{
@@ -401,9 +401,24 @@ public sealed class Config : IGuidStore
 			// an antivirus or OneDrive holding it for a moment. Renaming a perfectly good file to
 			// .bad because a read collided with a scanner is how settings disappear for good —
 			// the second such collision deleted the previous .bad on the way past.
-			return new Config { LoadError = Describe(ex) + " — файл не тронут, настройки взяты по умолчанию" };
+			return Stamped(new Config { LoadError = Describe(ex) + " — файл не тронут, настройки взяты по умолчанию" });
 		}
 		return new Config();
+	}
+
+	/// <summary>
+	/// Puts the write time of the file we failed to read onto the object we are returning instead,
+	/// so <see cref="ChangedOnDisk"/> keeps meaning "edited since we looked" rather than "we never
+	/// managed to look". Without it a broken — or briefly locked — file reported itself as edited
+	/// for the rest of the session: the diagnostics window said so with nobody having touched it,
+	/// and every menu click re-read the file before saving.
+	/// </summary>
+	private static Config Stamped(Config config)
+	{
+		// A missing stamp is only a nuisance; failing the load over one would be worse.
+		try { if (File.Exists(Path)) config.Stamp = File.GetLastWriteTimeUtc(Path); }
+		catch (Exception) { /* leave it at default — ChangedOnDisk then errs towards re-reading */ }
+		return config;
 	}
 
 	private static string Describe(Exception ex) => ex.GetType().Name + ": " + ex.Message;

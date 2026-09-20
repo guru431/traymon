@@ -184,7 +184,7 @@ internal static class Program
 		Say($"top io   {string.Join(", ", r.TopIo.Select(t => $"{t.Name} {t.Mb.ToString("0.0", ci)}"))}");
 		if (r.Battery is not null)
 			Say($"battery  {r.Battery.Charge.ToString("0", ci).PadLeft(3)} %      " +
-				$"{(r.Battery.OnBattery ? "on battery" : "on line")}" +
+				$"{r.Battery.OnBattery switch { true => "on battery", false => "on line", _ => "power state unknown" }}" +
 				$"{(r.Battery.MinutesLeft.HasValue ? ", " + r.Battery.MinutesLeft.Value.ToString("0", ci) + " min left" : "")}");
 		if (ups.Present)
 			Say($"ups      {Fmt(r.Ups.Charge)} %      {r.Ups.StatusText}, " +
@@ -1801,13 +1801,23 @@ internal sealed class TrayApp : ApplicationContext
 		var battery = _r.Battery;
 		if (battery is null) return;
 		var slot = Slot("battery", BatteryMetric, BatteryGuid);
-		var severity = battery.OnBattery ? 100 - battery.Charge : 0;
+		// Only a *known* mains connection silences the charge thresholds. Windows answers
+		// "unknown" on some machines, and taking that for mains power drew a green plate over a
+		// state nobody had measured — the very thing the UPS branch refuses to do. Severity is
+		// not left empty either: Record() would then colour the slot by the charge itself, and on
+		// an inverted metric a full battery is what that paints red.
+		var severity = battery.OnBattery == false ? 0 : 100 - battery.Charge;
 		Record(slot, battery.Charge, severity, unit: "%");
 		var left = battery.MinutesLeft.HasValue
 			? $"   ещё {battery.MinutesLeft.Value.ToString("0", CultureInfo.InvariantCulture)} мин"
 			: "";
-		Show(slot, Whole(battery.Charge), severity,
-			$"{Pct(battery.Charge)} {(battery.OnBattery ? "от батареи" : "от сети")}{left}");
+		var power = battery.OnBattery switch
+		{
+			true => "от батареи",
+			false => "от сети",
+			_ => "состояние питания неизвестно",
+		};
+		Show(slot, Whole(battery.Charge), severity, $"{Pct(battery.Charge)} {power}{left}");
 	}
 
 	private void ShowUptime()
@@ -3088,7 +3098,7 @@ internal sealed class TrayApp : ApplicationContext
 			replace = true;
 		}
 
-		if (Autostart.Enable(replace, out var error))
+		if (Autostart.Enable(replace, _config.Tools?.Smartctl, out var error))
 		{
 			Info("TrayMon будет запускаться при входе в Windows.");
 			return Autostart.IsEnabled;

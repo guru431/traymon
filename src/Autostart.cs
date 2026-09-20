@@ -196,9 +196,15 @@ internal static class Autostart
 			if (string.Equals(wanted, identity.Name, StringComparison.OrdinalIgnoreCase)) return true;
 		}
 		catch (Exception) { /* fall through to the environment form */ }
-		return string.Equals(wanted, $"{Environment.UserDomainName}\\{Environment.UserName}",
-							 StringComparison.OrdinalIgnoreCase) ||
-			   string.Equals(wanted, Environment.UserName, StringComparison.OrdinalIgnoreCase);
+		if (string.Equals(wanted, $"{Environment.UserDomainName}\\{Environment.UserName}",
+						  StringComparison.OrdinalIgnoreCase)) return true;
+		// The bare name only on a machine that is not in a domain. "admin" is one account here
+		// and a different one in DOMAIN\admin, and calling the second one ours is what the whole
+		// TaskState.Foreign branch exists to prevent: Enable would overwrite somebody else's task
+		// without asking, and Uninstall would delete it.
+		return string.Equals(Environment.UserDomainName, Environment.MachineName,
+							 StringComparison.OrdinalIgnoreCase)
+			&& string.Equals(wanted, Environment.UserName, StringComparison.OrdinalIgnoreCase);
 	}
 
 	/// <summary>
@@ -218,7 +224,12 @@ internal static class Autostart
 	/// installation and every user, so a second copy used to overwrite the first one's task in
 	/// silence.
 	/// </param>
-	public static bool Enable(bool replaceForeign, out string error)
+	/// <param name="smartctl">Configured path to smartctl.exe, exactly as <c>--once</c> and the
+	/// diagnostics window check it. Leaving it out here meant the one place that actually grants
+	/// the elevation checked less than the two places that only report on it: a smartctl.exe
+	/// redirected by TrayMon.json into a folder anybody can write gets our elevated token on the
+	/// first RAID poll.</param>
+	public static bool Enable(bool replaceForeign, string smartctl, out string error)
 	{
 		error = null;
 		if (ExePath is null) { error = NoApphost; return false; }
@@ -226,7 +237,7 @@ internal static class Autostart
 		// A task started with the highest available token and no prompt is exactly the asset an
 		// unprivileged process would like to point somewhere else. If anything in the load path
 		// lets somebody but an administrator write, creating that task hands them elevation.
-		if (InstallUnsafe(out var what))
+		if (InstallUnsafe(smartctl, out var what))
 		{
 			error =
 				$"{what}\n" +
@@ -609,9 +620,6 @@ internal static class Autostart
 		LastCheckError = errors.Count > 0 ? errors[0] : null;
 		return false;
 	}
-
-	/// <summary>Convenience overload for the places that have no settings at hand.</summary>
-	public static bool InstallUnsafe(out string what) => InstallUnsafe(null, out what);
 
 	private static bool LooseFile(FileInfo file, out string who)
 	{
