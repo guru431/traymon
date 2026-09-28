@@ -4,6 +4,35 @@
 не сделана. Файл существует ровно затем, чтобы одно и то же не подавалось заново —
 еженедельный `agents-md-sync-check` делает это каждую неделю. Отсюда ничего не удаляется.
 
+## 2026-09-26 · code-review: чтение GPU на тике вне per-family try/catch, `ShowGpus` без `Fresh` [P2]
+**Context:** auto-cron `ClaudeCodeReviewWeekly` (provider=ocg), `src/Program.cs` `Tick()`,
+строка `if (Due(ref _gpuAt, GpuEveryMs)) { _gpu.Read(_r); ... }`, category=bug.
+**What:** заявлено, что исключение NVML из `_gpu.Read` обрывает весь остаток тика (Spawn-читатели,
+семейства, `Fade`, журнал), а `ShowGpus` без `Fresh(_r.GpusAt, …)` бесконечно держит старый
+список в обычных цветах.
+**Status:** wontfix
+**Resolved:** 2026-09-28 — ложное срабатывание. `GpuSensor.Read` сам ловит **любое** исключение
+(`catch (Exception)` вокруг опроса всех карт) и публикует пустой список; `Reinit` в ветке
+«не готов» тоже целиком под своим `try`. Наружу из `Read` выйти нечему, и комментарии про
+«NVML after a driver reset» у цикла семейств — про датчики вообще, а не про незащищённый вызов.
+`Fresh` для GPU бессмыслен: чтение синхронное, на потоке интерфейса, и `GpusAt` ставится той же
+строкой сразу после него, так что снимок не бывает старше `GpuEveryMs`; зависнуть «в фоне» ему
+негде, а при отказе список и так пустой. Штамп у GPU нужен ради окна статистики, не ради свежести.
+
+## 2026-09-26 · code-review: при отказе `GlobalMemoryStatusEx` в подсказке остаются старые ГБ [P3]
+**Context:** auto-cron `ClaudeCodeReviewWeekly` (provider=ocg), `src/Sensors.cs`
+`MemorySensor.Read`, ветка ошибки, category=inconsistency.
+**What:** заявлено, что при отказе обнуляются `MemLoad` и `CommitUsedGb`, а `MemUsedGb`,
+`MemTotalGb` и `CommitTotalGb` остаются от прошлого опроса, и подсказка серой плашки продолжает
+показывать устаревшие гигабайты.
+**Status:** wontfix
+**Resolved:** 2026-09-28 — ложное срабатывание. При `MemLoad = null` `ShowCore` передаёт в
+`Record` пустые значение и severity, слот в этом тике живым не отмечается, и `Show()` выходит
+первой строкой (`if (slot.SeenTick != _tick) return;`) — подсказку формирует `Fade()` из причины
+и прощального значения, `LastText`/`LastValue` он же и чистит. Старые гигабайты не попадают ни в
+значок, ни в «Сводку…», ни в CSV. `--once` читает память один раз, прошлого опроса у него нет.
+Обнулять поля, которые никто не показывает, — обработка невозможного случая.
+
 ## 2026-09-20 · code-review: денилист `.sanitize-patterns` склеивается в одну строку [P1]
 **Context:** auto-cron `ClaudeCodeReviewWeekly` (provider=ocg), `.githooks/_scan.sh:70`,
 category=security.
