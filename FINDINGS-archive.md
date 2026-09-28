@@ -5,7 +5,7 @@
 еженедельный `agents-md-sync-check` делает это каждую неделю. Отсюда ничего не удаляется.
 
 ## 2026-09-26 · code-review: чтение GPU на тике вне per-family try/catch, `ShowGpus` без `Fresh` [P2]
-**Context:** auto-cron `ClaudeCodeReviewWeekly` (provider=ocg), `src/Program.cs` `Tick()`,
+**Context:** еженедельное автоматическое ревью кода, `src/Program.cs` `Tick()`,
 строка `if (Due(ref _gpuAt, GpuEveryMs)) { _gpu.Read(_r); ... }`, category=bug.
 **What:** заявлено, что исключение NVML из `_gpu.Read` обрывает весь остаток тика (Spawn-читатели,
 семейства, `Fade`, журнал), а `ShowGpus` без `Fresh(_r.GpusAt, …)` бесконечно держит старый
@@ -20,7 +20,7 @@
 негде, а при отказе список и так пустой. Штамп у GPU нужен ради окна статистики, не ради свежести.
 
 ## 2026-09-26 · code-review: при отказе `GlobalMemoryStatusEx` в подсказке остаются старые ГБ [P3]
-**Context:** auto-cron `ClaudeCodeReviewWeekly` (provider=ocg), `src/Sensors.cs`
+**Context:** еженедельное автоматическое ревью кода, `src/Sensors.cs`
 `MemorySensor.Read`, ветка ошибки, category=inconsistency.
 **What:** заявлено, что при отказе обнуляются `MemLoad` и `CommitUsedGb`, а `MemUsedGb`,
 `MemTotalGb` и `CommitTotalGb` остаются от прошлого опроса, и подсказка серой плашки продолжает
@@ -34,7 +34,7 @@
 Обнулять поля, которые никто не показывает, — обработка невозможного случая.
 
 ## 2026-09-20 · code-review: денилист `.sanitize-patterns` склеивается в одну строку [P1]
-**Context:** auto-cron `ClaudeCodeReviewWeekly` (provider=ocg), `.githooks/_scan.sh:70`,
+**Context:** еженедельное автоматическое ревью кода, `.githooks/_scan.sh:70`,
 category=security.
 **What:** заявлено, что `tr -d` удаляет из денилиста переводы строк, все шаблоны склеиваются
 в один и проверка на персональные данные не срабатывает никогда, хотя хук сообщает об успехе.
