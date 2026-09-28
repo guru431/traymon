@@ -50,18 +50,19 @@ public sealed class UpsSensor
 	private readonly int _timeoutMs;
 	private readonly byte[] _community;
 
+	private static readonly string[] AllOids =
+		{ CapacityOid, RunTimeOid, StatusOid, LoadOid, ReplaceOid };
+
 	/// <summary>
 	/// The varbinds still being asked for. An SNMPv1 GET is all or nothing: an agent that does
 	/// not carry one of these OIDs — Back-UPS models and PowerChute Personal have no output load,
 	/// non-APC agents have none of them — answers noSuchName and returns *no* values at all. The
 	/// icon then said "no answer from the SNMP agent" about an agent that had answered. The
 	/// offending varbind is named by the error index, so it is dropped and remembered.
+	/// Filled from <see cref="AllOids"/>, as Rediscover refills it: two copies of the list meant
+	/// the first poll and every later one could ask for different sets.
 	/// </summary>
-	private readonly List<string> _oids = new()
-		{ CapacityOid, RunTimeOid, StatusOid, LoadOid, ReplaceOid };
-
-	private static readonly string[] AllOids =
-		{ CapacityOid, RunTimeOid, StatusOid, LoadOid, ReplaceOid };
+	private readonly List<string> _oids = new(AllOids);
 
 	private readonly List<string> _dropped = new();
 

@@ -115,9 +115,13 @@ public sealed unsafe class PdhQuery : IDisposable
 			}
 			if (rc != PDH_MORE_DATA || size == 0) return;
 
+			// The new block first, then the old one freed: an AllocHGlobal that throws after the
+			// free left _buffer pointing at released memory, which the next read handed to PDH and
+			// Dispose freed a second time.
+			var grown = Marshal.AllocHGlobal((int)size);
 			if (_buffer != IntPtr.Zero) Marshal.FreeHGlobal(_buffer);
+			_buffer = grown;
 			_bufferSize = size;
-			_buffer = Marshal.AllocHGlobal((int)size);
 		}
 	}
 

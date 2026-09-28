@@ -45,7 +45,7 @@ public sealed record DiskReading(string Name, double Temp, double? WearPercent, 
 /// <summary>Battery of a laptop or tablet, as Windows reports it.</summary>
 public sealed class BatteryReading
 {
-	public double Charge;          // % of capacity
+	public double? Charge;         // % of capacity; null when Windows answers 255, "not known"
 	/// <summary>Mains unplugged. Null when Windows answers <c>ACLineStatus = 255</c>: that is
 	/// "not known", and reporting it as mains power is the same mistake
 	/// <see cref="UpsReading.OnBattery"/> exists to avoid — a green plate over a state nobody
@@ -254,17 +254,25 @@ public static class BatterySensor
 	private static extern bool GetSystemPowerStatus(out SystemPowerStatus status);
 
 	private const byte NoBattery = 128;
+	private const byte UnknownFlag = 255;
 
 	public static void Read(Readings r)
 	{
-		if (!GetSystemPowerStatus(out var s) || s.BatteryFlag == NoBattery || s.BatteryLifePercent > 100)
+		// No battery at all only when Windows says so, or when it knows neither the flag nor the
+		// charge — which is how some machines without one answer, and a battery icon there would be
+		// a permanent grey dash for hardware that does not exist.
+		if (!GetSystemPowerStatus(out var s) || s.BatteryFlag == NoBattery ||
+			(s.BatteryFlag == UnknownFlag && s.BatteryLifePercent > 100))
 		{
 			r.Battery = null;
 			return;
 		}
 		r.Battery = new BatteryReading
 		{
-			Charge = s.BatteryLifePercent,
+			// A battery that is there but cannot say its charge right now is a grey icon saying
+			// so. Dropping the whole reading made it "Windows reports no battery" in the tooltip,
+			// and a charge unknown from the start meant no icon at all.
+			Charge = s.BatteryLifePercent <= 100 ? s.BatteryLifePercent : null,
 			OnBattery = s.ACLineStatus switch { 0 => true, 1 => false, _ => null },
 			MinutesLeft = s.BatteryLifeTime >= 0 ? s.BatteryLifeTime / 60.0 : null,
 		};

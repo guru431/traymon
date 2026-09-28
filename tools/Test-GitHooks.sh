@@ -40,18 +40,21 @@ check() {
   fi
 }
 
+# Called directly, not as $(new_repo): the trap has to be set in this shell, not in a subshell.
 new_repo() {
   repo=$(mktemp -d)
+  # Removed on any exit, not only at the end: under `set -eu` an unguarded failure part-way
+  # through — a `git rev-parse` in case 6 — ended the script and left the directory behind.
+  trap 'rm -rf "$repo"' EXIT
   git -C "$repo" init -q
   git -C "$repo" config user.email traymon@example.invalid
   git -C "$repo" config user.name TrayMon
   git -C "$repo" config core.hooksPath "$hooks"
   git -C "$repo" config commit.gpgsign false
-  echo "$repo"
 }
 
 # 1) A token after a '#' in a `-m` message. The whole class the hook missed.
-repo=$(new_repo)
+new_repo
 echo one > "$repo/a.txt"
 git -C "$repo" add a.txt
 rc=0
@@ -129,7 +132,6 @@ rc=0
 ( cd "$repo" && git commit -q -m "add c" ) >/dev/null 2>&1 || rc=$?
 check "pre-commit: content matching no denylist line is accepted" 0 "$rc"
 
-rm -rf "$repo"
 echo ""
 echo "passed $passed, failed $failed"
 [ "$failed" -eq 0 ]

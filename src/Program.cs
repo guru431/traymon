@@ -183,7 +183,7 @@ internal static class Program
 		Say($"uptime   {(r.UptimeHours.HasValue ? r.UptimeHours.Value.ToString("0.0", ci) + " h" : "—")}");
 		Say($"top io   {string.Join(", ", r.TopIo.Select(t => $"{t.Name} {t.Mb.ToString("0.0", ci)}"))}");
 		if (r.Battery is not null)
-			Say($"battery  {r.Battery.Charge.ToString("0", ci).PadLeft(3)} %      " +
+			Say($"battery  {Fmt(r.Battery.Charge)} %      " +
 				$"{r.Battery.OnBattery switch { true => "on battery", false => "on line", _ => "power state unknown" }}" +
 				$"{(r.Battery.MinutesLeft.HasValue ? ", " + r.Battery.MinutesLeft.Value.ToString("0", ci) + " min left" : "")}");
 		if (ups.Present)
@@ -347,7 +347,7 @@ internal static class Program
 /// Every icon is a slot with a stable id; which slots are shown, what colour their plate is
 /// and how they are labelled comes from <see cref="Config"/> and is edited from the tray menu.
 /// </summary>
-internal sealed class TrayApp : ApplicationContext
+internal sealed class TrayApp : ApplicationContext, IGuidStore
 {
 	/// <summary>Built-in poll rate. <see cref="Config.TickMs"/> may raise it, never lower it.</summary>
 	private const int TickMs = 2000;
@@ -829,7 +829,8 @@ internal sealed class TrayApp : ApplicationContext
 		// The pools remember what they handed out, in the settings file: the assignment used to
 		// live only in memory, so after a restart with one device absent the next device took its
 		// GUID — and with it the tray position and the visibility Windows keeps against it.
-		var store = (IGuidStore)_config;
+		// This object, not _config: see the IGuidStore members below.
+		var store = (IGuidStore)this;
 		_gpuPool = new GuidPool("видеокарт", "gpu", GpuGuids, store);
 		_vramPool = new GuidPool("значков видеопамяти", "vram", VramGuids, store);
 		_gpuTempPool = new GuidPool("температур GPU", "gpu.temp", GpuTempGuids, store);
@@ -951,7 +952,7 @@ internal sealed class TrayApp : ApplicationContext
 		}
 		try
 		{
-			if (_configDirty) { _config.Save(); _configDirty = false; }
+			if (_configDirty && CatchUpWithFile()) { _config.Save(); _configDirty = false; }
 			foreach (var slot in _order) { slot.Icon?.Dispose(); slot.Icon = null; }
 		}
 		catch (Exception ex) { Trouble(ex, "завершение сеанса"); }
@@ -1280,7 +1281,8 @@ internal sealed class TrayApp : ApplicationContext
 			return _ups.ChargeUnavailable
 				? "агент отвечает, но не отдаёт заряд батареи — похоже, это не APC PowerNet MIB"
 				: _ups.LastError ?? "нет ответа от SNMP-агента";
-		if (slot.Id == "battery") return "Windows не сообщает о батарее";
+		if (slot.Id == "battery")
+			return _r.Battery is null ? "Windows не сообщает о батарее" : "Windows не знает заряд батареи";
 		if (slot.Id == "worst") return "нет ни одного источника, который можно оценить";
 		if (slot.Id == "cpu.temp") return SensorHint("датчик не отвечает");
 		if (slot.Id.StartsWith("gpu", StringComparison.Ordinal) ||
@@ -1801,13 +1803,16 @@ internal sealed class TrayApp : ApplicationContext
 		var battery = _r.Battery;
 		if (battery is null) return;
 		var slot = Slot("battery", BatteryMetric, BatteryGuid);
+		// The slot exists, nothing is recorded: Fade greys it and Reason says the charge is unknown.
+		if (!battery.Charge.HasValue) return;
+		var charge = battery.Charge.Value;
 		// Only a *known* mains connection silences the charge thresholds. Windows answers
 		// "unknown" on some machines, and taking that for mains power drew a green plate over a
 		// state nobody had measured — the very thing the UPS branch refuses to do. Severity is
 		// not left empty either: Record() would then colour the slot by the charge itself, and on
 		// an inverted metric a full battery is what that paints red.
-		var severity = battery.OnBattery == false ? 0 : 100 - battery.Charge;
-		Record(slot, battery.Charge, severity, unit: "%");
+		var severity = battery.OnBattery == false ? 0 : 100 - charge;
+		Record(slot, charge, severity, unit: "%");
 		var left = battery.MinutesLeft.HasValue
 			? $"   ещё {battery.MinutesLeft.Value.ToString("0", CultureInfo.InvariantCulture)} мин"
 			: "";
@@ -2215,6 +2220,9 @@ internal sealed class TrayApp : ApplicationContext
 		// touches the disk regularly. The flag is cleared only on success — clearing it regardless
 		// meant a single failed write threw away the automatic first-run choices for good.
 		if (!_configDirty || _dry || _tick % 15 != 0) return;
+		// This runs before PickUpConfigEdit in the same tick, so an edit saved a moment ago is
+		// still unread here. A file caught half-written waits for the next round.
+		if (!CatchUpWithFile()) return;
 		if (_config.Save(out var error)) { _configDirty = false; _firstRun = false; return; }
 		_lastTickError = "настройки не сохранены: " + error;
 	}
@@ -2570,10 +2578,9 @@ internal sealed class TrayApp : ApplicationContext
 			{
 				var mine = _config.Icons.TryGetValue(slot.Id, out var entry) ? entry : null;
 				// Slot assignments are ours, never edited by hand, and must not be lost to a reload.
-				foreach (var (pool, table) in _config.Slots) fresh.Slots[pool] = table;
-				if (mine is null) fresh.Icons.Remove(slot.Id);
-				else fresh.Icons[slot.Id] = mine;
-				_config = fresh;
+				Adopt(fresh);
+				if (mine is null) _config.Icons.Remove(slot.Id);
+				else _config.Icons[slot.Id] = mine;
 				// And the icons follow it: a colour or a caption edited in the file otherwise sat
 				// in memory unapplied, because the save below makes the file look already read.
 				ApplySettings();
@@ -3163,15 +3170,52 @@ internal sealed class TrayApp : ApplicationContext
 			if (!silent) Info($"Файл не прочитан: {fresh.LoadError}", MessageBoxIcon.Warning);
 			return;
 		}
-		foreach (var (pool, table) in _config.Slots)
-			if (!fresh.Slots.ContainsKey(pool)) fresh.Slots[pool] = table;
-		_config = fresh;
+		Adopt(fresh);
 		ApplySettings();
 		EnsureSomethingVisible();
 		if (silent) return;
 		Info("Настройки перечитаны.\n\nАдрес ИБП, путь к smartctl, фильтр адаптеров и период опроса " +
 			 "применятся после перезапуска программы — они читаются один раз при старте.");
 	}
+
+	/// <summary>
+	/// Makes a config read from disk the current one, keeping what only this process knows. The
+	/// slot table is ours and is never edited by hand, so it is taken from memory whole: the reload
+	/// used to keep only the pools the file did not have at all, and an identity handed out since
+	/// the last save was lost whenever the file had that pool — after a restart the source then got
+	/// somebody else's GUID, with its tray position and visibility.
+	/// </summary>
+	private void Adopt(Config fresh)
+	{
+		fresh.Slots = _config.Slots;
+		if (_config.TakeDirty()) _configDirty = true;
+		_config = fresh;
+	}
+
+	/// <summary>
+	/// Takes in an edit made to the file since it was read, before anything is written over it. The
+	/// file is serialised whole, so the scheduled save, the one on exit and the one that switches an
+	/// icon back on wrote the object in memory over a hand edit the debounced reload had not reached
+	/// yet — and the reload then saw our own stamp and never noticed. False when the file has changed
+	/// but cannot be read, an editor half-way through a save: nothing may be written over it then.
+	/// </summary>
+	private bool CatchUpWithFile()
+	{
+		if (!_config.ChangedOnDisk) return true;
+		var fresh = Config.Read();
+		if (fresh.LoadError is not null) return false;
+		Adopt(fresh);
+		ApplySettings();
+		return true;
+	}
+
+	// The pools' store is whichever Config is current. They were handed _config itself, which tied
+	// them to the object read at startup: every reload replaces it, so after the first one the
+	// identities they gave out were remembered in an object nobody saved, and marked dirty there.
+	bool IGuidStore.TryGet(string pool, string key, out Guid guid) => ((IGuidStore)_config).TryGet(pool, key, out guid);
+	string IGuidStore.OwnerOf(string pool, Guid guid) => ((IGuidStore)_config).OwnerOf(pool, guid);
+	void IGuidStore.Set(string pool, string key, Guid guid) => ((IGuidStore)_config).Set(pool, key, guid);
+	void IGuidStore.Remove(string pool, string key) => ((IGuidStore)_config).Remove(pool, key);
 
 	/// <summary>Hands the settings now in <c>_config</c> to every slot and every live icon.</summary>
 	private void ApplySettings()
@@ -3205,10 +3249,21 @@ internal sealed class TrayApp : ApplicationContext
 		// during a logon, which is the failure mode the whole program avoids elsewhere.
 		if (_order.Any(s => s.Settings.Enabled)) return;
 
+		// An edit on disk is taken in before the change below, not after it: adopting the file
+		// later would drop the change, and saving without it would drop the edit. Only down here,
+		// past the check above, because this runs every tick and the file is asked with a syscall.
+		var current = CatchUpWithFile();
+		if (_order.Any(s => s.Settings.Enabled)) return;   // the edit switched one on itself
+
 		var first = _order.FirstOrDefault(s => s.Icon is not null) ?? _order[0];
 		Own(first).Enabled = true;
-		if (_config.Save(out var error)) _configDirty = false;
-		else _lastTickError = "настройки не сохранены: " + error;
+		// Not over a file caught half-written: the icon is on in memory, and the reload that
+		// follows the finished edit brings this check round again if it still hides them all.
+		if (current)
+		{
+			if (_config.Save(out var error)) _configDirty = false;
+			else _lastTickError = "настройки не сохранены: " + error;
+		}
 		first.Settings = _config.Get(first.Id);
 		Push(first, first.LastText, first.LastSeverity);
 		// Said once per occurrence, not once per tick.
@@ -3677,7 +3732,8 @@ internal sealed class TrayApp : ApplicationContext
 			if (_configDirty && !_dry)
 			{
 				_configDirty = false;
-				try { _config.Save(); } catch (Exception) { /* going away regardless */ }
+				// Over a hand edit only after taking it in; over a half-written one not at all.
+				try { if (CatchUpWithFile()) _config.Save(); } catch (Exception) { /* going away regardless */ }
 			}
 			if (!_dry)
 			{

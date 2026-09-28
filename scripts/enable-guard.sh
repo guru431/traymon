@@ -68,6 +68,18 @@ else
     echo "[skip] .sanitize-patterns / $seed already present — left untouched"
 fi
 
+# The seed is a reference, not the denylist. With only the seed in place — and in a fresh clone,
+# right after seeding it — the hooks print WARN on every commit and skip the personal-data check,
+# while this script ended on "Done". Looked up the way the hooks look it up (main checkout, then
+# the user-level copy), through the same function, not as ./.sanitize-patterns.
+. .githooks/_scan.sh
+denylist=$(scan_denylist_path)
+if [ ! -f "$denylist" ]; then
+    echo "[warn] no denylist at $denylist — the personal-data check is SKIPPED on every commit"
+    echo "       (the generic secret-format check does run). Create it, then re-run."
+    rc=1
+fi
+
 echo ""
 if [ "$rc" -eq 0 ]; then
     echo "Done. Commits and pushes in this clone now run the secret-guard."

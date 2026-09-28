@@ -67,7 +67,12 @@ function Get-Labels([string[]]$lines) {
 }
 
 Write-Host "Запуск: dotnet $Dll --once"
+# Windows PowerShell 5.1 превращает каждую строку stderr нативной команды под 2>&1 в
+# NativeCommandError, и при "Stop" первая же из них — сообщение хоста dotnet, необработанное
+# исключение — обрывала скрипт вместо сверки. В pwsh 7 так не бывает, отсюда разное поведение.
+$ErrorActionPreference = "Continue"
 $output = & dotnet $Dll --once 2>&1 | ForEach-Object { "$_" }
+$ErrorActionPreference = "Stop"
 
 # Пример в README — первый блок ``` после строки с --once
 $readmeLines = Get-Content $Readme
