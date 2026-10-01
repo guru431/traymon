@@ -86,7 +86,7 @@ public sealed class TrayValueIcon : IDisposable
 
 	/// <summary>
 	/// Register icons without a GUID. Only for the paired-build measurement described in
-	/// CLAUDE.md: two copies of the program cannot both own a GUID, and without this the second
+	/// docs/measuring.md: two copies of the program cannot both own a GUID, and without this the second
 	/// one spends the whole run fighting the first for identities instead of doing the work being
 	/// measured. Never set in normal operation — icons then group and lose their positions.
 	/// </summary>

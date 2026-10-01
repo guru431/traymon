@@ -17,7 +17,7 @@ internal static class Program
 		if (Has(args, "--once"))
 			return RunOnce(Has(args, "--icons"), Number(args, "--ticks", 1));
 
-		// Measurement mode, described in CLAUDE.md and nowhere in the README: the only honest way
+		// Measurement mode, described in docs/measuring.md and nowhere in the README: the only honest way
 		// to compare two builds on a machine under load is to run them side by side, and two
 		// copies cannot both own a tray GUID. This drops the single-instance lock and registers
 		// icons without GUIDs, so neither copy spends the run taking icons away from the other.
@@ -3434,7 +3434,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 						"(ожидание сети, внешнего процесса и блокировки), а не процессорное время");
 		// The number the whole project exists for, and until now it could only be got with an
 		// external script. Everything above measures our own threads; this measures the process.
-		// It still does not include the repaint the shell does in explorer.exe — see CLAUDE.md.
+		// It still does not include the repaint the shell does in explorer.exe — see docs/measuring.md.
 		try
 		{
 			_self.Refresh();
