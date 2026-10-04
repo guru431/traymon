@@ -39,6 +39,20 @@ scan_denylist_path() {
   printf '%s' "$scan_sp"
 }
 
+# The denylist at <path> as patterns for `grep -Ef`, one per line, on stdout:
+# blank lines dropped (an empty pattern matches everything) and CRs too (a
+# CRLF-saved file would leave a trailing \r on every line and match nothing).
+# Returns non-zero when the file cannot be read, and both callers refuse then.
+# The preparation used to hide that behind `2>/dev/null ... || true`: an
+# unreadable file came back as an empty list, read as "no patterns", and the
+# personal-data check was skipped without a word — the silent pass that failing
+# closed on a broken regex was there to rule out.
+scan_denylist_patterns() {
+  scan_draw=$(tr -d '\r' < "$1") || return 2
+  printf '%s\n' "$scan_draw" | grep -vE '^[[:space:]]*$'
+  [ "$?" -le 1 ] || return 2
+}
+
 # scan_text <label> <text> -> 0 clean, 1 blocked
 scan_text() {
   scan_label=$1
@@ -57,7 +71,8 @@ scan_text() {
   # `192\.168\.1\.[0-9]+`, `0nk\.ru`. Reading it with -F would both miss every
   # such line and, on Git Bash, abort grep outright (rc=134) instead of
   # reporting anything. A scanner error (grep rc>1) fails closed, so a broken
-  # regex in the file blocks the commit rather than silently passing it.
+  # regex in the file blocks the commit rather than silently passing it, and so
+  # does a file that exists but cannot be read — see scan_denylist_patterns.
   # The MAIN worktree's root, not this worktree's — see scan_denylist_path,
   # which both hooks now share. Fall back to a shared user-level copy, and if
   # there is none, SAY so instead of skipping in silence.
@@ -67,8 +82,14 @@ scan_text() {
   fi
   if [ -f "$scan_sp" ]; then
     scan_pat=$(mktemp 2>/dev/null || echo "$scan_sp.tmp")
-    grep -vE '^[[:space:]]*$' "$scan_sp" 2>/dev/null | tr -d '' > "$scan_pat" || true
-    if [ -s "$scan_pat" ]; then
+    scan_rc=0
+    scan_denylist_patterns "$scan_sp" > "$scan_pat" || scan_rc=$?
+    if [ "$scan_rc" -ne 0 ]; then
+      echo "BLOCKED: $scan_sp exists but could not be read — refusing."
+      scan_fail=1
+    elif [ ! -s "$scan_pat" ]; then
+      echo "WARN: $scan_sp holds no patterns — the personal-data check is SKIPPED."
+    else
       scan_rc=0
       scan_hits=$(printf '%s\n' "$scan_body" | grep -inEf "$scan_pat") || scan_rc=$?
       if [ "$scan_rc" -gt 1 ]; then

@@ -303,7 +303,9 @@ public sealed class UpsSensor
 				reply.Vars[DecodeOid(name.Raw)] = value;
 				at = bindingEnd;
 			}
-			return reply;
+			// A success with nothing in it answers none of the OIDs asked for. Taken as one, it ended
+			// the wait for the real reply and set Present and Answered with every value empty.
+			return reply.Vars.Count == 0 ? null : reply;
 		}
 		catch (FormatException)
 		{

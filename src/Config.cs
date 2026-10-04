@@ -401,7 +401,11 @@ public sealed class Config : IGuidStore
 			// an antivirus or OneDrive holding it for a moment. Renaming a perfectly good file to
 			// .bad because a read collided with a scanner is how settings disappear for good —
 			// the second such collision deleted the previous .bad on the way past.
-			return Stamped(new Config { LoadError = Describe(ex) + " — файл не тронут, настройки взяты по умолчанию" });
+			// "Defaults in use" only on the start-up path: a re-read that fails is never adopted —
+			// every caller keeps the settings it has — and its message is shown to the user as is.
+			return Stamped(new Config { LoadError = Describe(ex) + (recover
+				? " — файл не тронут, настройки взяты по умолчанию"
+				: " — файл не тронут") });
 		}
 		return new Config();
 	}

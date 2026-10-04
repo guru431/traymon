@@ -575,6 +575,8 @@ public sealed class GpuSensor : IDisposable
 		}
 	}
 
+	/// <param name="status">0 when the card answered at least one of utilization, memory and
+	/// temperature; otherwise the utilization error code.</param>
 	private GpuReading ReadCard(Card card, out int status)
 	{
 		double? load = null, temp = null, memLoad = null, fanRpm = null, fanDuty = null;
@@ -587,14 +589,22 @@ public sealed class GpuSensor : IDisposable
 			// case that matters: the driver is there, the card is not.
 			LastError = "NVML: карта не отвечает (код " + status + ")";
 
-		if (NvmlGetMemory(card.Handle, out var mem) == 0 && mem.Total > 0)
+		var memRc = NvmlGetMemory(card.Handle, out var mem);
+		if (memRc == 0 && mem.Total > 0)
 		{
 			const double gb = 1024.0 * 1024 * 1024;
 			usedGb = mem.Used / gb;
 			totalGb = mem.Total / gb;
 			memLoad = 100.0 * mem.Used / mem.Total;
 		}
-		if (NvmlGetTemperature(card.Handle, 0 /* NVML_TEMPERATURE_GPU */, out var t) == 0) temp = t;
+		var tempRc = NvmlGetTemperature(card.Handle, 0 /* NVML_TEMPERATURE_GPU */, out var t);
+		if (tempRc == 0) temp = t;
+
+		// A card that answers anything has not been lost. Utilization alone decided it, so a card
+		// that does not report utilization at all, or a busy driver returning 999 for it three polls
+		// running, had NVML torn down and brought back under memory and temperature that were
+		// reading fine.
+		if (memRc == 0 || tempRc == 0) status = 0;
 
 		// Prefer real RPM; older drivers only expose the duty cycle. A successful call reporting
 		// zero means the fan has stopped — which is the whole point of the fan icon — so it must

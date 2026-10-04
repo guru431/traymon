@@ -142,7 +142,9 @@ internal static class Program
 		}
 		r.UptimeHours = PerfSensors.ReadUptime();
 
-		// Serial numbers only exist once something has answered, so they join the list here.
+		// Serial numbers only exist once something has answered, so they join the list here. The
+		// lines below print none; the icon layer under --icons does, in the slot ids and tooltips
+		// of the disks behind RAID, and it is handed this same redactor.
 		foreach (var d in r.RaidDisks) hide.Hide(d.Serial, "<serial>");
 		foreach (var d in r.Disks) hide.Hide(d.Serial, "<serial>");
 
@@ -2277,8 +2279,11 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		{
 			if (_logQueue.Count >= 4) { _logDropped++; return; }
 			_logQueue.Enqueue(lines.ToString());
+			// Asked under the lock the writer gives up under. Asked after it, a writer that had just
+			// found the queue empty but not yet lowered the flag looked busy, and this batch sat in
+			// the queue until the next log interval.
+			if (Interlocked.Exchange(ref _logWriting, 1) == 1) return;
 		}
-		if (Interlocked.Exchange(ref _logWriting, 1) == 1) return;
 		Spawn(FlushLog);
 	}
 
@@ -2301,7 +2306,10 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 				string batch;
 				lock (_logQueue)
 				{
-					if (_logQueue.Count == 0) return;
+					// Lowered here, under the lock, and not in a finally as well: one there would come
+					// down after the next writer could already have started, and let a third run
+					// beside it.
+					if (_logQueue.Count == 0) { Volatile.Write(ref _logWriting, 0); return; }
 					batch = _logQueue.Dequeue();
 				}
 				Roll(path);
@@ -2326,8 +2334,8 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		{
 			// A full or read-only disk must not take the monitor down with it.
 			_lastTickError = "журнал: " + ex.Message;
+			Volatile.Write(ref _logWriting, 0);
 		}
-		finally { Volatile.Write(ref _logWriting, 0); }
 	}
 
 	/// <summary>Rolls the trail over once it reaches its limit. A monitor that fills the disk it
@@ -2584,6 +2592,18 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 				// And the icons follow it: a colour or a caption edited in the file otherwise sat
 				// in memory unapplied, because the save below makes the file look already read.
 				ApplySettings();
+			}
+			else
+			{
+				// Not over an edit that cannot be read: the save below went ahead anyway and wrote
+				// the object in memory over a hand edit with one typo in it — with no .bad, because
+				// only the start-up load keeps one and Read must not touch the file. The automatic
+				// writes already refuse here (CatchUpWithFile); a menu click was the one that did not.
+				slot.Settings = _config.Get(slot.Id);
+				Info($"Настройки не сохранены: TrayMon.json изменён и не читается.\n\n{fresh.LoadError}\n\n" +
+					 "Изменение действует до перечитывания настроек или перезапуска программы.",
+					 MessageBoxIcon.Warning);
+				return;
 			}
 		}
 		slot.Settings = _config.Get(slot.Id);

@@ -131,6 +131,31 @@ git -C "$repo" add c.txt
 rc=0
 ( cd "$repo" && git commit -q -m "add c" ) >/dev/null 2>&1 || rc=$?
 check "pre-commit: content matching no denylist line is accepted" 0 "$rc"
+git -C "$repo" reset -q
+
+# 9) A denylist that exists but cannot be read refuses the commit. Preparing the list hid the read
+#    error behind `2>/dev/null ... || true`: the unreadable file became an empty list, the personal
+#    check was skipped without a word, and the very value it lists went in. A deny ACE on Windows
+#    (chmod does not take read away from the owner on NTFS), mode 000 elsewhere; an account that
+#    reads the file anyway — root — cannot show this, and is told so rather than counted.
+#    MSYS_NO_PATHCONV: Git Bash otherwise rewrites `/deny` into a path under its install folder.
+printf 'zaphod\\.example\\.invalid\n' > "$repo/.sanitize-patterns"
+if command -v icacls >/dev/null 2>&1; then
+  MSYS_NO_PATHCONV=1 icacls "$(cygpath -w "$repo/.sanitize-patterns")" /deny "$USERDOMAIN\\$USERNAME:(RD)" >/dev/null 2>&1 || true
+else
+  chmod 000 "$repo/.sanitize-patterns"
+fi
+if cat "$repo/.sanitize-patterns" >/dev/null 2>&1; then
+  echo "  skip pre-commit: unreadable denylist (this account reads it anyway)"
+else
+  echo "host = zaphod.example.invalid" > "$repo/c.txt"
+  git -C "$repo" add c.txt
+  rc=0
+  ( cd "$repo" && git commit -q -m "add c" ) >/dev/null 2>&1 || rc=$?
+  check "pre-commit: a denylist that cannot be read refuses the commit" 1 "$rc"
+  git -C "$repo" reset -q
+fi
+rm -f "$repo/.sanitize-patterns"
 
 echo ""
 echo "passed $passed, failed $failed"

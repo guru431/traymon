@@ -103,6 +103,14 @@ public sealed class SnmpParserTests
 	public void RejectsAnAnswerToSomebodyElsesRequest() =>
 		Assert.Null(Sensor().ParseVarBinds(Response(8, 0, 0, Community, Gauge(CapacityOid, 61)), 7));
 
+	/// <summary>
+	/// A success status with nothing in it is not an answer. Taken as one, it ended the wait for the
+	/// real reply and marked the UPS as answering, with every value empty.
+	/// </summary>
+	[Fact]
+	public void RejectsASuccessWithoutAVarbind() =>
+		Assert.Null(Sensor().ParseVarBinds(Response(7, 0, 0, Community), 7));
+
 	[Fact]
 	public void RejectsTheWrongCommunity() =>
 		Assert.Null(Sensor().ParseVarBinds(Response(7, 0, 0, "private", Gauge(CapacityOid, 61)), 7));

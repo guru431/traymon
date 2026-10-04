@@ -167,9 +167,9 @@ pat="$tmpdir/patterns"
 # carrying only a personal marker went out unexamined.
 sp=$(scan_denylist_path)
 if [ -f "$sp" ]; then
-  # tr -d '\r': a CRLF-saved denylist would leave a trailing \r on every line
-  # and silently match nothing.
-  grep -vE '^[[:space:]]*$' "$sp" 2>/dev/null | tr -d '\r' > "$pat" || true
+  # The shared reader: an unreadable denylist is a refusal, not an empty list
+  # that lets the fast path suspect nothing.
+  scan_denylist_patterns "$sp" > "$pat" || die "$sp exists but could not be read"
 fi
 
 suspect=0
