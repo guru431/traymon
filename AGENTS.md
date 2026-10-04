@@ -8,7 +8,7 @@
 
 ```powershell
 dotnet publish src/TrayMon.csproj -c Release -o out
-out\TrayMon.exe --once                    # из консоли администратора: значения + цена источников
+out\TrayMon.exe --once                    # из консоли, открытой ОТ АДМИНИСТРАТОРА: значения + цена источников
 out\TrayMon.exe --once --icons --ticks 3  # тики слоя иконок; ненулевой код = исключение
 dotnet out\TrayMon.dll --once             # то же без прав: манифест берётся у dotnet.exe
 dotnet test tests/TrayMon.Tests/TrayMon.Tests.csproj
