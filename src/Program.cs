@@ -170,7 +170,8 @@ internal static class Program
 			Say("raid     no answer over CSMI (smartctl.exe missing, or no RAID controller here)");
 		foreach (var d in r.RaidDisks)
 			Say($"raid     {(d.Temp.HasValue ? d.Temp.Value.ToString("0", ci) : " —")} °C     {d.Name} <serial>   " +
-				$"health {(string.IsNullOrEmpty(d.Health) ? "—" : d.Health)}   (behind RAID controller)");
+				$"health {(string.IsNullOrEmpty(d.Health) ? "—" : d.Health)}   " +
+				$"({(d.Asleep ? "asleep, left so; name and health from its last answer" : "behind RAID controller")})");
 		foreach (var f in r.Slow.Fans)
 			Say($"fan      {f.Rpm.ToString("0", ci).PadLeft(4)} rpm   {(f.Duty.HasValue ? f.Duty.Value.ToString("0", ci) + "%" : "—")}   {f.Chip}/{f.Name}{(f.Rpm == 0 ? "   (header empty)" : "")}");
 		foreach (var n in r.Nets)
@@ -200,7 +201,11 @@ internal static class Program
 		if (lhm.Ring0Note is not null) Say($"ring-0 device:  {lhm.Ring0Note}");
 		Say($"elevated:       {(TrayApp.IsElevated ? "yes" : "no")}");
 		Say($"smartctl:       {(hdd.Available ? "found" : "not found")}");
-		if (hdd.Note is not null) Say($"                {hdd.Note}");
+		// A fixed line, not the note itself: the note names the account from the ACE and, when an
+		// ancestor is the loose one, that folder's absolute path — neither of which the redactor
+		// knows about. The full text is in the diagnostics window.
+		if (hdd.Note is not null)
+			Say("                started from a folder a non-administrator can write to — who, in «Диагностика…»");
 		// Whether, not who: the identity would be a domain and account name, and this output goes
 		// into public issue trackers. The name is in the diagnostics window instead.
 		// The whole load path, not just the folder: a file inside a well-protected folder can carry
@@ -262,11 +267,17 @@ internal static class Program
 		new[] { "administrator", "admin", "user", "guest", "system", "workgroup", "администратор", "пользователь" }
 			.Contains(name.Trim(), StringComparer.OrdinalIgnoreCase);
 
+	/// <summary>
+	/// The state of the sensor library. Without an elevated token the library opens perfectly well
+	/// and reads nothing, so "loaded" alone was printed over a run in which no CPU temperature
+	/// could be had — and the README blamed the missing elevation on UNAVAILABLE, which it never is.
+	/// </summary>
 	private static string SensorDriverLine(LhmSensor lhm) =>
 		lhm.Disabled ? "DISABLED — " + lhm.LastError
-		: !lhm.Available ? "UNAVAILABLE — " + (lhm.LastError ?? "run elevated, or the driver refused to load")
+		: !lhm.Available ? "UNAVAILABLE — " + (lhm.LastError ?? "the library did not open")
 		: lhm.DriverBlocked ? "BLOCKED — " + lhm.LastError
-		: "loaded";
+		: TrayApp.IsElevated ? "loaded"
+		: "loaded, but reads no temperatures without an elevated token";
 
 	/// <summary>
 	/// Disk temperatures from the storage driver, with the sensor library filling in the NVMe
@@ -275,9 +286,11 @@ internal static class Program
 	/// </summary>
 	internal static List<DiskReading> DiskTemps(DiskSensor disk, LhmSensor lhm)
 	{
-		lhm.RefreshDiskTemps();
-		var fromLibrary = lhm.DiskTemps();
+		// The driver first: the library is then asked only about what the driver could not answer
+		// and about NVMe wear, instead of SMART-reading every drive to throw most of it away.
 		var fromDriver = disk.Read();
+		lhm.RefreshDiskTemps(name => fromDriver.Any(d => Similar(d.Name, name)));
+		var fromLibrary = lhm.DiskTemps();
 		return Merge(fromDriver, fromLibrary);
 	}
 
@@ -394,7 +407,17 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// running flag protects against, and therefore exactly what stops new attempts — kept showing
 	/// hours-old numbers in normal colours. Two periods plus the slowest timeout here.
 	/// </summary>
-	private static long MaxAgeMs(int periodMs) => 2L * periodMs + 30000;
+	/// <remarks>
+	/// Two periods <b>or two ticks</b>, whichever is longer. A family looks at the snapshot in the
+	/// same tick that sent its reader off, so what it sees is the one from the tick before — a whole
+	/// interval old. With TickMs above 42 s the CPU temperature and the fans were never fresh: the
+	/// icons sat grey with "опрос не завершился", and with them every overheating and standstill
+	/// alarm, while both README versions promise a raised TickMs delays detection by a tick at most.
+	/// </remarks>
+	private long MaxAgeMs(int periodMs) => 2L * Math.Max(periodMs, Interval) + 30000;
+
+	/// <summary>The timer's interval right now — raised while the session is idle.</summary>
+	private int Interval => _timer?.Interval ?? _intervalMs;
 
 	/// <summary>
 	/// A source silent for this long has its tray slot handed back to the pool. Wall clock, not
@@ -549,6 +572,13 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 
 		/// <summary>Whether a transition into the red raises a balloon unless the user says otherwise.</summary>
 		public bool NotifyByDefault;
+
+		/// <summary>
+		/// No five-minute line in the tooltip. Uptime only grows, a UPS polled every thirty seconds
+		/// has a handful of points in the window, and a volume needs the room for its three busiest
+		/// processes: the tooltip is cut at 127 characters, and the line pushed the third one out.
+		/// </summary>
+		public bool NoStats;
 	}
 
 	private static readonly Metric CpuMetric = new() { Group = "Процессор", Order = 0, Label = "CPU", Unit = "%", Plate = CpuPlate, Warn = 70, Crit = 85, Pool = new[] { CpuGuid } };
@@ -562,7 +592,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private static readonly Metric RaidMetric = new() { Group = "Диски", Order = 1, Label = "Диск за RAID", Unit = "°C", Plate = RaidTempPlate, Warn = 55, Crit = 65, Pool = RaidTempGuids, NotifyByDefault = true };
 	private static readonly Metric FanMetric = new() { Group = "Вентиляторы", Order = 0, Label = "Вентилятор", Unit = "об/мин", Plate = FanPlate, Warn = 50, Crit = 90, Pool = FanGuids, StallAlarm = true, NotifyByDefault = true };
 	private static readonly Metric NetMetric = new() { Group = "Сеть", Order = 0, Label = "Сеть", Unit = "% полосы", Plate = NetPlate, Warn = 70, Crit = 90, Pool = NetGuids };
-	private static readonly Metric VolumeMetric = new() { Group = "Тома", Order = 0, Label = "Том", Unit = "МБ/с", Plate = VolumePlate, Warn = NeverAlerts, Crit = NeverAlerts, Pool = VolumeGuids };
+	private static readonly Metric VolumeMetric = new() { Group = "Тома", Order = 0, Label = "Том", Unit = "МБ/с", Plate = VolumePlate, Warn = NeverAlerts, Crit = NeverAlerts, Pool = VolumeGuids, NoStats = true };
 	// Not Inverted: the thresholds and the severity are both "percent used", so the number in the
 	// dialog is already the number that colours the plate. What is inverted is only the icon,
 	// which draws gigabytes free.
@@ -571,14 +601,16 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	// versions promised a notification for the UPS and it had none: the only interrupt it ever
 	// raised was the separate "switched to battery" message, which ignored the setting entirely,
 	// so a low charge or a worn battery said nothing at all unless the user found the checkbox.
-	private static readonly Metric UpsMetric = new() { Group = "Питание", Order = 0, Label = "ИБП", Unit = "% заряда", Plate = UpsPlate, Warn = 50, Crit = 75, Pool = new[] { UpsGuid }, Inverted = true, NotifyByDefault = true };
+	private static readonly Metric UpsMetric = new() { Group = "Питание", Order = 0, Label = "ИБП", Unit = "% заряда", Plate = UpsPlate, Warn = 50, Crit = 75, Pool = new[] { UpsGuid }, Inverted = true, NotifyByDefault = true, NoStats = true };
 	private static readonly Metric BatteryMetric = new() { Group = "Питание", Order = 1, Label = "Батарея", Unit = "% заряда", Plate = BatteryPlate, Warn = 60, Crit = 85, Pool = new[] { BatteryGuid }, Inverted = true };
-	private static readonly Metric UptimeMetric = new() { Group = "Прочее", Order = 0, Label = "Время работы", Unit = "ч", Plate = UptimePlate, Warn = NeverAlerts, Crit = NeverAlerts, Pool = new[] { UptimeGuid } };
+	private static readonly Metric UptimeMetric = new() { Group = "Прочее", Order = 0, Label = "Время работы", Unit = "ч", Plate = UptimePlate, Warn = NeverAlerts, Crit = NeverAlerts, Pool = new[] { UptimeGuid }, NoStats = true };
 	// 78 and 100 on a scale where every metric's own yellow threshold maps to 78 and its own red
 	// to 100 — see Score(). The mapping used to be a plain 100·severity/crit, which put the
 	// yellows of the built-in metrics anywhere between 67 (UPS) and 93 (RAM): the summary icon
 	// was still green while the UPS icon it was summarising had been yellow for twenty percent.
-	private static readonly Metric WorstMetric = new() { Group = "Прочее", Order = 1, Label = "Худшее состояние", Unit = "% от красного порога", Plate = WorstPlate, Warn = 78, Crit = 100, Pool = new[] { WorstGuid } };
+	// Conventional units, not a percentage of anything: the README has always said so, the unit
+	// here did not.
+	private static readonly Metric WorstMetric = new() { Group = "Прочее", Order = 1, Label = "Худшее состояние", Unit = "усл. ед.", Plate = WorstPlate, Warn = 78, Crit = 100, Pool = new[] { WorstGuid } };
 
 	/// <summary>Order the headings appear in the menu, so a tick is where it was yesterday.</summary>
 	private static readonly string[] Groups =
@@ -591,6 +623,16 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		public string Id;
 		public Metric Metric;
 		public string DefaultLabel;
+
+		/// <summary>Thresholds the device itself reports, in place of the metric's built-in pair —
+		/// only a disk's own warning and critical temperature so far. The user's still win.</summary>
+		public (double Warn, double Crit)? OwnLimits;
+
+		/// <summary>Whether <see cref="OwnLimits"/> has been taken from a reading yet. Until then a
+		/// disk's built-in pair is not known, and a user threshold must not be judged against
+		/// 60/70: a "Warn": 75 is perfectly sound next to a drive's own 85.</summary>
+		public bool LimitsKnown;
+
 		public Guid Guid;
 		public GuidPool Pool;      // null for a single icon that can never be reassigned
 		public string PoolKey;
@@ -660,6 +702,10 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private readonly GuidPool _netPool, _volumePool, _freePool, _diskPool, _raidPool, _fanPool;
 	private readonly GuidPool[] _pools;
 
+	/// <summary>Id prefix, metric and pool of every pooled family, for the slots of required
+	/// sources that have not turned up — see <see cref="ExpectRequired"/>.</summary>
+	private readonly (string Prefix, Metric Metric, GuidPool Pool)[] _pooledFamilies;
+
 	private readonly PerfSensors _perf;
 	private readonly GpuSensor _gpu;
 	private readonly LhmSensor _lhm;
@@ -703,7 +749,61 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private bool _greeted;
 	private string _topIoLine = "";
 	private bool? _lastOnBattery;
+
+	// What the UPS last said about its bypass and its battery, for the warning-level events. Null
+	// until its first answer: a UPS already in bypass when the program starts is reported too.
+	private bool? _lastBypass, _lastReplace;
+
 	private long _lastLogAt = long.MinValue / 4;
+
+	/// <summary>
+	/// The slot table in memory was built with no file behind it — the file could not be read at
+	/// start — so it holds no history. Until a file is adopted, a reload takes the file's table and
+	/// only adds to it; see <see cref="Config.AddSlotsFrom"/>.
+	/// </summary>
+	private bool _slotsUnread;
+
+	/// <summary>When the previous tick ran, to notice the machine having been asleep.</summary>
+	private long _lastTickAt;
+
+	/// <summary>
+	/// When the machine came back from sleep, or zero. Environment.TickCount64 runs on through
+	/// sleep, so on the first tick after it every background snapshot was hours old while its
+	/// reader had only just been sent off: the disks, the RAID, the fans and the UPS went grey,
+	/// every required one of them reported its data lost and then back, and after a night longer
+	/// than a day the same tick handed their GUIDs back to the pools. Until a reader publishes
+	/// after this moment its icons are left as they were — see <see cref="AwaitingReader"/>.
+	/// </summary>
+	private long _resumedAt;
+
+	/// <summary>When the session went idle, for the summary shown on coming back; zero while
+	/// somebody is there.</summary>
+	private long _idleSince;
+
+	/// <summary>Why the CSV trail is not being written, when it is refused, and the path that was
+	/// checked; see <see cref="LogRefused"/>.</summary>
+	private volatile string _logRefusal;
+	private string _logCheckedPath;
+
+	/// <summary>The stop event has been written already — by the end of the session.</summary>
+	private int _stopLogged;
+
+	// ---- what the program spends its own cycles on, for "Диагностика…" ----
+
+	private enum Cost { Pdh, MemBattery, Gpu, Sensors, TopIo, Disks, Raid, Ups, Space, Icons, Log, Settings }
+
+	private static readonly string[] CostNames =
+	{
+		"счётчики PDH (CPU, сеть, тома)", "память, батарея", "GPU (NVML)", "датчики CPU и вентиляторы",
+		"процессы по вводу-выводу", "температуры дисков", "диски за RAID (без smartctl.exe)",
+		"ИБП (без SNMP-агента)", "свободное место", "семейства значков и статистика", "журнал CSV",
+		"файл настроек",
+	};
+
+	private readonly long[] _cycles = new long[CostNames.Length];
+
+	private void Charge(Cost what, ulong since) =>
+		Interlocked.Add(ref _cycles[(int)what], (long)(CycleClock.Now() - since));
 
 	// Deadlines, in Environment.TickCount64. See the period constants: what used to be "every Nth
 	// tick with phase P" is now "not before this moment".
@@ -730,8 +830,10 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// and the second one arrives inside the first window's modal loop.</summary>
 	private bool _summaryOpen;
 
-	/// <summary>Last fifty colour changes, for "why was it red at three in the morning".</summary>
-	private readonly Queue<string> _journal = new();
+	/// <summary>Last fifty colour changes, for "why was it red at three in the morning". Each with
+	/// its moment, the level it went to and whether the source is a required one, so the summary on
+	/// coming back to the session can count what was missed.</summary>
+	private readonly Queue<(long At, int Level, bool Required, string Line)> _journal = new();
 
 	// Sources that are simply not present on this machine stop being asked so often.
 	private int _upsFailures, _raidFailures;
@@ -819,6 +921,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	{
 		_dry = dryRun;
 		_firstRun = !File.Exists(Config.Path);
+		_slotsUnread = _config.LoadError is not null;
 		_ownsSensors = perf is null;
 		_perf = perf ?? new PerfSensors(_config.Net);
 		_gpu = gpu ?? new GpuSensor();
@@ -845,6 +948,15 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		_fanPool = new GuidPool("вентиляторов", "fan", FanGuids, store);
 		_pools = new[] { _gpuPool, _vramPool, _gpuTempPool, _gpuFanPool, _netPool,
 						 _volumePool, _freePool, _diskPool, _raidPool, _fanPool };
+		// Longer prefixes first: "gpu.temp." is also "gpu.", "disk.raid." also "disk.".
+		_pooledFamilies = new (string, Metric, GuidPool)[]
+		{
+			("gpu.temp.", GpuTempMetric, _gpuTempPool), ("fan.gpu.", GpuFanMetric, _gpuFanPool),
+			("gpu.", GpuMetric, _gpuPool), ("vram.", VramMetric, _vramPool),
+			("disk.raid.", RaidMetric, _raidPool), ("disk.", DiskMetric, _diskPool),
+			("fan.", FanMetric, _fanPool), ("net.", NetMetric, _netPool),
+			("vol.", VolumeMetric, _volumePool), ("free.", FreeMetric, _freePool),
+		};
 
 		_families = new (string, Action)[]
 		{
@@ -876,12 +988,19 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// The one moment a dirty settings file and a tray full of icons both have to be dealt
 		// with at once, and the only notice given.
 		Microsoft.Win32.SystemEvents.SessionEnding += OnSessionEnding;
+		// And the moment it is no longer a question: the process is about to be ended without
+		// Dispose, so this is where the stop event goes.
+		Microsoft.Win32.SystemEvents.SessionEnded += OnSessionEnded;
 		WatchConfigFile();
 
 		_timer = new System.Windows.Forms.Timer { Interval = _intervalMs };
 		_timer.Tick += OnTick;
 		_timer.Start();
 		OnTick(null, EventArgs.Empty);
+		// After the first tick, so the count is of icons that exist.
+		WindowsLog.Note($"TrayMon {Version} запущен: значков включено " +
+						$"{_order.Count(s => s.Settings.Enabled).ToString(CultureInfo.InvariantCulture)}" +
+						$"{(_config.LoadError is null ? "" : "; файл настроек не прочитан — " + _config.LoadError)}.");
 	}
 
 	/// <summary>
@@ -932,14 +1051,56 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 							or Microsoft.Win32.SessionSwitchReason.ConsoleConnect;
 		if (!idle && !busy) return;
 		_sessionIdle = idle;
-		if (_timer is null) return;
+		// A stopped timer is the program on its way out: Uninstall stops it so that nothing writes
+		// the program back while its report is on the screen, and a lock or an RDP reconnect under
+		// that report used to tick anyway — every icon came back with NIM_ADD, and the shell wrote
+		// the tray entries the report had just said were removed.
+		if (_timer is null || !_timer.Enabled) return;
 		_timer.Interval = idle ? Math.Max(IdleTickMs, _intervalMs) : _intervalMs;
+		if (idle)
+		{
+			if (_idleSince == 0) _idleSince = Environment.TickCount64;
+			return;
+		}
+		if (!busy) return;
+		SayWhatWasMissed();
 		// Coming back: refresh everything at once rather than up to thirty seconds later for the
 		// cheap sources and up to ten minutes later for the rest. The first thing somebody does
 		// after unlocking is look at the icons.
-		if (!busy) return;
 		_catchUp = true;
 		OnTick(null, EventArgs.Empty);
+	}
+
+	/// <summary>
+	/// One message on coming back to the session, when something happened while nobody was looking.
+	/// The balloons raised meanwhile went to a screen nobody saw, the journal is behind
+	/// «Диагностика…», and a change into the red that began and ended in the meantime — on a metric
+	/// with no notification by default most of all — left no trace on the icons at all.
+	/// </summary>
+	/// <remarks>
+	/// Through <see cref="Balloon"/>, not <see cref="Notify"/>: every event it counts is already
+	/// in the Windows log, and this is a reminder to the person, not an event of its own.
+	/// </remarks>
+	private void SayWhatWasMissed()
+	{
+		var since = _idleSince;
+		_idleSince = 0;
+		if (since == 0 || _dry) return;
+		int reds = 0, lost = 0;
+		foreach (var (at, level, required, _) in _journal)
+		{
+			if (at < since) continue;
+			if (level == Alarm.Critical) reds++;
+			else if (level == Alarm.Dead && required) lost++;
+		}
+		if (reds + lost == 0) return;
+		var ci = CultureInfo.InvariantCulture;
+		var redNow = _order.Count(s => s.Level == Alarm.Critical);
+		Balloon("TrayMon: пока вас не было",
+			(reds > 0 ? $"переходов в красное: {reds.ToString(ci)}. " : "") +
+			(lost > 0 ? $"Пропадали обязательные источники: {lost.ToString(ci)}. " : "") +
+			$"Сейчас красных: {redNow.ToString(ci)}. Подробности — «Диагностика…».",
+			warning: reds > 0);
 	}
 
 	private void OnSessionEnding(object sender, Microsoft.Win32.SessionEndingEventArgs e)
@@ -954,10 +1115,29 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		}
 		try
 		{
-			if (_configDirty && CatchUpWithFile()) { _config.Save(); _configDirty = false; }
+			// Cleared only on success, as everywhere else: a failed write here used to drop the flag
+			// all the same, and neither Dispose nor Housekeeping then tried again.
+			if (_configDirty && CatchUpWithFile())
+			{
+				if (_config.Save(out var error)) _configDirty = false;
+				else _lastTickError = "настройки не сохранены: " + error;
+			}
 			foreach (var slot in _order) { slot.Icon?.Dispose(); slot.Icon = null; }
+			// This is a question, and an application can still cancel the end of the session. The
+			// families with a data version redraw only when the data changes, so their icons would
+			// have come back up to ten minutes later; forgetting what was shown brings them back on
+			// the next tick.
+			_shownDisks = _shownRaid = _shownUps = -1;
 		}
 		catch (Exception ex) { Trouble(ex, "завершение сеанса"); }
+	}
+
+	private void OnSessionEnded(object sender, Microsoft.Win32.SessionEndedEventArgs e)
+	{
+		// From the SystemEvents thread and without waiting for the UI one: the process is ended
+		// right after this returns, and the event log does not care which thread writes to it.
+		if (Interlocked.Exchange(ref _stopLogged, 1) == 1) return;
+		WindowsLog.Note("TrayMon остановлен: сеанс завершается.");
 	}
 
 	/// <summary>
@@ -1069,45 +1249,69 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private void Tick()
 	{
 		_tick++;
+		NoticeSleep();
+		var cycles = CycleClock.Now();
 		var io = Due(ref _ioAt, IoEveryMs);
 		_perf.Read(_r, io);   // CPU every tick, network and volumes rarer
 		if (io) _r.IoAt = Environment.TickCount64;
+		Charge(Cost.Pdh, cycles);
+		cycles = CycleClock.Now();
 		MemorySensor.Read(_r);
 		BatterySensor.Read(_r);
 		// Free: GetTickCount64, not a PDH query over the System object. See PerfSensors.ReadUptime.
 		_r.UptimeHours = PerfSensors.ReadUptime();
-		if (Due(ref _gpuAt, GpuEveryMs)) { _gpu.Read(_r); _r.GpusAt = Environment.TickCount64; }
+		Charge(Cost.MemBattery, cycles);
+		if (Due(ref _gpuAt, GpuEveryMs))
+		{
+			cycles = CycleClock.Now();
+			_gpu.Read(_r);
+			_r.GpusAt = Environment.TickCount64;
+			Charge(Cost.Gpu, cycles);
+		}
 
 		// The heavy readers are all off the UI thread, each behind its own flag. The sensor
 		// library alone measured 18-45 ms, which is a fifth of a second of a frozen message pump
 		// every six seconds when it ran here.
-		if (Due(ref _slowAt, SlowEveryMs)) Spawn(RefreshSlow);
+		// At normal priority, unlike the rest: the CPU path of the library moves its thread from
+		// core to core, and a background-mode thread waits on every busy core for the scheduler's
+		// anti-starvation boost — so under a full load, exactly when the CPU temperature matters,
+		// one read could outlast its freshness limit and grey the icon out. Its cost in cycles is
+		// the same at either priority.
+		if (Due(ref _slowAt, SlowEveryMs)) Spawn(RefreshSlow, Cost.Sensors, background: false);
 		// The ~250-instance process query is the most expensive PDH read here and was the one
-		// thing left running on the UI thread, against a README that said otherwise.
-		if (Due(ref _topIoAt, TopIoEveryMs) && _r.Volumes.Sum(v => v.ReadMb + v.WriteMb) > 0.5)
-			Spawn(RefreshTopIo);
-		if (Due(ref _diskAt, DiskEveryMs)) Spawn(RefreshDisks);
-		if (Due(ref _raidAt, RaidEveryMs) && Environment.TickCount64 >= _raidRetryAt) Spawn(RefreshRaidDisk);
-		if (Due(ref _upsAt, UpsEveryMs) && Environment.TickCount64 >= _upsRetryAt) Spawn(RefreshUps);
+		// thing left running on the UI thread, against a README that said otherwise. Only for a
+		// volume icon somebody is showing: the tail of that tooltip is the only thing that reads it,
+		// and with the volumes hidden — the default — it was five collects a minute for nobody.
+		if (Due(ref _topIoAt, TopIoEveryMs) && AnyVolumeShown() && _r.Volumes.Sum(v => v.ReadMb + v.WriteMb) > 0.5)
+			Spawn(RefreshTopIo, Cost.TopIo);
+		if (Due(ref _diskAt, DiskEveryMs)) Spawn(RefreshDisks, Cost.Disks);
+		if (Due(ref _raidAt, RaidEveryMs) && Environment.TickCount64 >= _raidRetryAt) Spawn(RefreshRaidDisk, Cost.Raid);
+		if (Due(ref _upsAt, UpsEveryMs) && Environment.TickCount64 >= _upsRetryAt) Spawn(RefreshUps, Cost.Ups);
 		if (Due(ref _spaceAt, SpaceEveryMs))
 		{
 			// The names are taken here and not inside the task: the volume list belongs to the UI
 			// thread and is cleared and refilled on it from here.
 			var names = _r.Volumes.Select(v => v.Name).ToArray();
-			Spawn(() => RefreshSpace(names));
+			Spawn(() => RefreshSpace(names), Cost.Space);
 		}
 
 		// Each family on its own: a source that throws — NVML after a driver reset, the sensor
 		// library while its driver unloads — must cost its own icons, not every icon that
 		// happens to be displayed after it in this method. The array is built once, so the loop
 		// allocates nothing per tick.
+		cycles = CycleClock.Now();
+		var tray = Volatile.Read(ref TrayValueIcon.Cycles);
 		foreach (var family in _families)
 		{
 			try { family.Show(); }
 			catch (Exception ex) { Trouble(ex, family.Name); }
 		}
+		ExpectRequired();
 
 		Fade();
+		// The drawing and the shell calls made on the way are counted by the icons themselves.
+		Interlocked.Add(ref _cycles[(int)Cost.Icons],
+			(long)(CycleClock.Now() - cycles) - (Volatile.Read(ref TrayValueIcon.Cycles) - tray));
 		// Every tick from the second one on, not only on the second. A settings file with every
 		// icon switched off is a legitimate hand edit, and a pooled icon can be the last one
 		// carrying the menu while its device is unplugged — Fade then handed the slot back after a
@@ -1115,7 +1319,9 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// first tick: it runs inside the constructor, before the message loop exists, and this can
 		// put a dialog on the screen.
 		if (!_dry && _tick >= 2) EnsureSomethingVisible();
+		cycles = CycleClock.Now();
 		Housekeeping();
+		Charge(Cost.Settings, cycles);
 		// Losing every colour, label and threshold is not something to mention only to
 		// someone who thinks to open the diagnostics window. On the second tick, for the same
 		// reason as above. Only a file that could not be read at all gets this dialog: a value
@@ -1125,13 +1331,104 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		if (_tick == 2 && !_dry && _config.LoadError is not null)
 			Later($"Файл настроек не прочитан, взяты значения по умолчанию:\n\n{_config.LoadError}",
 				MessageBoxIcon.Warning);
-		if (Due(ref _statsAt, StatsEveryMs)) RefreshStats();
+		if (Due(ref _statsAt, StatsEveryMs))
+		{
+			cycles = CycleClock.Now();
+			tray = Volatile.Read(ref TrayValueIcon.Cycles);
+			RefreshStats();
+			Interlocked.Add(ref _cycles[(int)Cost.Icons],
+				(long)(CycleClock.Now() - cycles) - (Volatile.Read(ref TrayValueIcon.Cycles) - tray));
+		}
 		// Cleared once every deadline of this tick has been asked: coming back to a session makes
 		// all of them due at once, which is the point — a source polled every ten minutes must not
 		// keep a ten-minute-old number on the screen somebody has just started looking at.
 		_catchUp = false;
+		cycles = CycleClock.Now();
 		PickUpConfigEdit();
+		Charge(Cost.Settings, cycles);
+		cycles = CycleClock.Now();
 		WriteLogLine();
+		Charge(Cost.Log, cycles);
+	}
+
+	/// <summary>
+	/// Notices that the machine has been asleep: far longer between two ticks than any interval
+	/// the timer can have. The forget-after-a-day clock of every slot is moved on by the gap — a
+	/// night of sleep is not a day of silence — and the background readers get until their next
+	/// snapshot before their icons count as dead. See <see cref="_resumedAt"/>.
+	/// </summary>
+	private void NoticeSleep()
+	{
+		var now = Environment.TickCount64;
+		var gap = now - _lastTickAt;
+		var asleep = _lastTickAt != 0 && gap > 2L * Math.Max(IdleTickMs, _intervalMs) + 30000;
+		_lastTickAt = now;
+		if (_resumedAt != 0 && now - _resumedAt > MaxAgeMs(RaidEveryMs)) _resumedAt = 0;
+		if (!asleep) return;
+		_resumedAt = now;
+		foreach (var slot in _order) slot.SeenAtMs += gap;
+	}
+
+	/// <summary>
+	/// Whether this slot is waiting for its background reader's first snapshot after the machine
+	/// woke up — and so is neither alive nor dead yet. Bounded by the reader's own freshness limit,
+	/// so a reader that hangs after the sleep still greys its icons out as it would have otherwise.
+	/// </summary>
+	private bool AwaitingReader(IconSlot slot) =>
+		_resumedAt != 0 && Snapshot(slot, out var at, out var period) &&
+		at < _resumedAt && Environment.TickCount64 - _resumedAt <= MaxAgeMs(period);
+
+	private bool AnyVolumeShown()
+	{
+		foreach (var slot in _order)
+			if (ReferenceEquals(slot.Metric, VolumeMetric) && slot.Settings.Enabled) return true;
+		return false;
+	}
+
+	/// <summary>
+	/// A slot for every source marked as required that has not turned up: a grey icon with its
+	/// reason, and a gap the summary icon counts. The families only create slots for what their
+	/// sources report, so a required UPS whose agent had not answered once since the start — or a
+	/// required disk, volume or adapter absent at the start — was nowhere at all: no icon, no line
+	/// in the menu, and "нет данных: N" in the summary icon did not count it.
+	/// </summary>
+	/// <remarks>
+	/// The change from "never seen" to "no data" is not announced: on every start each source goes
+	/// through it for the few seconds before its reader answers. What is announced is losing data
+	/// that was there.
+	/// </remarks>
+	private void ExpectRequired()
+	{
+		var missing = false;
+		foreach (var (id, settings) in _config.Icons)
+			if (settings?.Required == true && !_slots.ContainsKey(id)) { missing = true; break; }
+		if (!missing) return;   // the ordinary case, and it allocates nothing
+
+		var ids = _config.Icons.Where(p => p.Value?.Required == true && !_slots.ContainsKey(p.Key))
+			.Select(p => p.Key).ToList();
+		foreach (var id in ids) Expect(id);
+	}
+
+	private void Expect(string id)
+	{
+		switch (id)
+		{
+			case "cpu.temp": Slot(id, CpuTempMetric, CpuTempGuid); return;
+			case "ups": Slot(id, UpsMetric, UpsGuid); return;
+			case "battery": Slot(id, BatteryMetric, BatteryGuid); return;
+		}
+		foreach (var (prefix, metric, pool) in _pooledFamilies)
+		{
+			if (!id.StartsWith(prefix, StringComparison.Ordinal)) continue;
+			var key = id.Substring(prefix.Length);
+			var card = pool.Id is "gpu" or "vram" or "gpu.temp" or "fan.gpu";
+			// Ids in an older scheme are carried over by Migrate when their source turns up, and a
+			// placeholder under the old id would stay behind as a grey ghost holding a GUID.
+			var old = pool.Id == "fan" ? !key.Contains('/') : card && key.All(char.IsDigit);
+			if (key.Length == 0 || old) return;
+			Pooled(id, metric, pool, key, pool.Id == "free" ? $"Свободно {key}" : card ? metric.Label : key);
+			return;
+		}
 	}
 
 	/// <summary>
@@ -1199,7 +1496,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 
 	/// <summary>Whether a background reader's last snapshot is recent enough to be shown as a
 	/// measurement rather than as a memory. See <see cref="MaxAgeMs"/>.</summary>
-	private static bool Fresh(long at, int periodMs) =>
+	private bool Fresh(long at, int periodMs) =>
 		at != 0 && Environment.TickCount64 - at <= MaxAgeMs(periodMs);
 
 	/// <summary>
@@ -1214,6 +1511,9 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		{
 			var slot = _order[i];
 			if (slot.SeenTick == _tick) { slot.Dead = false; continue; }
+			// Just back from sleep, with the reader already sent off: neither alive nor dead yet,
+			// and calling it dead now is a false "данные пропали" a few seconds before it answers.
+			if (!slot.Dead && AwaitingReader(slot)) continue;
 
 			if (!slot.Dead)
 			{
@@ -1288,7 +1588,20 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		if (slot.Id == "worst") return "нет ни одного источника, который можно оценить";
 		if (slot.Id == "cpu.temp") return SensorHint("датчик не отвечает");
 		if (slot.Id.StartsWith("gpu", StringComparison.Ordinal) ||
-			slot.Id.StartsWith("vram", StringComparison.Ordinal)) return _gpu.LastError ?? "нет драйвера NVIDIA";
+			slot.Id.StartsWith("vram", StringComparison.Ordinal))
+		{
+			// The card is there and answering something: say what it did not give, not that the
+			// driver is missing. The sensor's own error text is cleared on any poll a card answers.
+			foreach (var g in _r.Gpus)
+			{
+				if ((g.Key ?? g.Index.ToString(CultureInfo.InvariantCulture)) != slot.PoolKey) continue;
+				var (what, code) = ReferenceEquals(slot.Metric, VramMetric) ? ("занятость памяти", g.MemCode)
+								 : ReferenceEquals(slot.Metric, GpuTempMetric) ? ("температуру", g.TempCode)
+								 : ("загрузку", g.LoadCode);
+				return $"карта отвечает, но не отдала {what} (NVML, код {code.ToString(CultureInfo.InvariantCulture)})";
+			}
+			return _gpu.LastError ?? "нет драйвера NVIDIA";
+		}
 		return "источник молчит";
 	}
 
@@ -1305,8 +1618,18 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private bool Stale(IconSlot slot, out string message)
 	{
 		message = null;
-		long at;
-		int period;
+		if (!Snapshot(slot, out var at, out var period)) return false;
+		if (at == 0 || Fresh(at, period)) return false;
+		var seconds = (Environment.TickCount64 - at) / 1000;
+		message = "опрос не завершился — данные устарели на " +
+				  seconds.ToString(CultureInfo.InvariantCulture) + " с";
+		return true;
+	}
+
+	/// <summary>Which background reader feeds this slot: the moment of its last snapshot and its
+	/// period. False for everything read on the tick itself.</summary>
+	private bool Snapshot(IconSlot slot, out long at, out int period)
+	{
 		if (slot.Id.StartsWith("disk.raid.", StringComparison.Ordinal)) { at = _r.RaidAt; period = RaidEveryMs; }
 		else if (slot.Id.StartsWith("disk.", StringComparison.Ordinal)) { at = _r.DisksAt; period = DiskEveryMs; }
 		else if (slot.Id.StartsWith("free.", StringComparison.Ordinal)) { at = _r.SpaceAt; period = SpaceEveryMs; }
@@ -1314,12 +1637,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		else if (slot.Id == "cpu.temp" ||
 				 (slot.Id.StartsWith("fan.", StringComparison.Ordinal) &&
 				  !slot.Id.StartsWith("fan.gpu", StringComparison.Ordinal))) { at = _r.SlowAt; period = SlowEveryMs; }
-		else return false;
-
-		if (at == 0 || Fresh(at, period)) return false;
-		var seconds = (Environment.TickCount64 - at) / 1000;
-		message = "опрос не завершился — данные устарели на " +
-				  seconds.ToString(CultureInfo.InvariantCulture) + " с";
+		else { at = 0; period = 0; return false; }
 		return true;
 	}
 
@@ -1451,6 +1769,15 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			var slot = Pooled($"disk.{key}", DiskMetric, _diskPool, key, key);
 			if (slot is null) continue;
 
+			// The drive's own limits replace the built-in 60/70 when it reports a sane pair: an
+			// NVMe drive under load runs at 60-70 by design, and its own WCTEMP/CCTEMP knows that.
+			if (!slot.LimitsKnown || slot.OwnLimits != d.Limits)
+			{
+				slot.OwnLimits = d.Limits;
+				slot.LimitsKnown = true;
+				KeepInOrder(slot);
+			}
+
 			// A disk that is wearing out matters more than a disk that is warm — the same
 			// argument that already puts a failing RAID disk straight into the red.
 			Record(slot, d.Temp, d.Worn ? NeverAlerts : d.Temp, unit: "°C", stamp: _r.DisksAt);
@@ -1459,8 +1786,12 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 				? $"   износ {d.WearPercent.Value.ToString("0", CultureInfo.InvariantCulture)}%" : "";
 			var spare = d.SparePercent.HasValue
 				? $"   резерв {d.SparePercent.Value.ToString("0", CultureInfo.InvariantCulture)}%" : "";
+			var limits = d.Limits is { } own
+				? $"   порог накопителя {own.Warn.ToString("0", CultureInfo.InvariantCulture)}/" +
+				  $"{own.Crit.ToString("0", CultureInfo.InvariantCulture)} °C"
+				: "";
 			Show(slot, Whole(d.Temp), d.Worn ? NeverAlerts : d.Temp,
-				$"{Deg(d.Temp)}{wear}{spare}{(d.Worn ? "   РЕСУРС ИСЧЕРПАН" : "")}");
+				$"{Deg(d.Temp)}{wear}{spare}{(d.Worn ? "   РЕСУРС ИСЧЕРПАН" : "")}{limits}");
 		}
 		_shownDisks = version;
 	}
@@ -1517,11 +1848,16 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			// when there is no temperature at all, which is why the severity is passed even when
 			// the value is missing.
 			var failing = HddSensor.Failing(d.Health);
-			var severity = failing ? NeverAlerts : d.Temp;
+			// A sleeping disk is alive and, unless its last answer said otherwise, fine: zero, not
+			// "no value", or it would go grey and a required one would report its data lost each
+			// time it parked.
+			var severity = failing ? NeverAlerts : d.Asleep ? 0 : d.Temp;
 			Record(slot, d.Temp, severity, unit: "°C", stamp: _r.RaidAt);
 			if (!changed) continue;
 			var health = string.IsNullOrEmpty(d.Health) ? "" : failing ? $"   ЗДОРОВЬЕ: {d.Health}" : "   здоровье в норме";
-			var noTemp = d.Temp.HasValue ? "" : "   температуры нет (standby или прошивка её не отдаёт)";
+			var noTemp = d.Asleep ? "   спит (standby), здоровье — из последнего ответа"
+					   : d.Temp.HasValue ? ""
+					   : "   температуры нет (прошивка её не отдаёт)";
 			Show(slot, Whole(d.Temp), severity, $"{Deg(d.Temp)}{health}{noTemp}");
 		}
 		_shownRaid = version;
@@ -1714,15 +2050,10 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// <summary>
 	/// The gigabytes-left condition expressed on the same "percent used" scale the plate is
 	/// coloured by, so the two conditions can simply be compared. Zero when it is not configured.
+	/// With a margin of its own once it has fired — see <see cref="Steps"/>.
 	/// </summary>
-	private double GigabyteSeverity(IconSlot slot, double freeGb)
-	{
-		var warnGb = slot.Settings.WarnGb;
-		var critGb = slot.Settings.CritGb;
-		if (critGb.HasValue && freeGb <= critGb.Value) return CritOf(slot);
-		if (warnGb.HasValue && freeGb <= warnGb.Value) return WarnOf(slot);
-		return 0;
-	}
+	private double GigabyteSeverity(IconSlot slot, double freeGb) =>
+		Steps.Gigabytes(freeGb, slot.Settings.WarnGb, slot.Settings.CritGb, WarnOf(slot), CritOf(slot), slot.Level);
 
 	/// <summary>
 	/// Charge of the UPS, once its SNMP agent has answered. Severity is inverted — a low charge
@@ -1747,6 +2078,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// policy as everything else: this branch used to call Balloon and the event log directly,
 		// so "Уведомлять при переходе в красный" did not switch it off, and one outage could
 		// produce both this message and a generic threshold one.
+		string power = null;
 		if (ups.OnBattery.HasValue && ups.OnBattery != _lastOnBattery)
 		{
 			var left = ups.RunTimeMin.HasValue
@@ -1754,12 +2086,38 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 				: "";
 			// The first answer counts too: _lastOnBattery being empty used to swallow it, so a UPS
 			// already running on battery when the program started said nothing.
-			var what = ups.OnBattery.Value
+			power = ups.OnBattery.Value
 				? $"ИБП {(_lastOnBattery.HasValue ? "перешёл на батарею" : "работает от батареи")}. Заряд {Pct(ups.Charge)}{left}."
 				: _lastOnBattery.HasValue ? "Питание от сети восстановлено." : null;
-			if (what is not null) Notify(slot, what, critical: ups.OnBattery.Value);
 		}
 		if (ups.OnBattery.HasValue) _lastOnBattery = ups.OnBattery;
+
+		// A worn battery and a bypass are yellow, and only the red used to be announced: the
+		// state that decides whether the next outage is survived stayed in a tooltip, on an icon
+		// hidden by default, until that outage. A warning-level event each time it changes — and
+		// at the first answer, like the battery above. Not AVR: on a poor mains it switches dozens
+		// of times a day, and an event that frequent is not one anybody reads.
+		string worse = null;
+		if (ups.Answered)
+		{
+			if (ups.Status.HasValue)
+			{
+				if (ups.Bypass && _lastBypass != true)
+					worse = $"ИБП работает через байпас ({ups.StatusText}) — отключение сети нагрузка может не пережить.";
+				else if (!ups.Bypass && _lastBypass == true)
+					worse = "ИБП вышел из байпаса.";
+				_lastBypass = ups.Bypass;
+			}
+			if (ups.NeedsNewBattery && _lastReplace != true)
+				worse = (worse is null ? "" : worse + " ") + "ИБП просит заменить батарею.";
+			else if (!ups.NeedsNewBattery && _lastReplace == true)
+				worse = (worse is null ? "" : worse + " ") + "ИБП больше не просит заменить батарею.";
+			_lastReplace = ups.NeedsNewBattery;
+		}
+		// One message, not two: a slot is notified once per tick, and the second would be lost.
+		if (power is not null || worse is not null)
+			Notify(slot, power is null ? worse : worse is null ? power : power + " " + worse,
+				critical: ups.OnBattery == true && power is not null);
 
 		// Nothing known at all: Fade() greys the icon and puts the reason in the tooltip, which
 		// is more honest than the old behaviour of keeping the last "on line" text next to a
@@ -1789,12 +2147,13 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		if (ups.OnBattery == true) return 100;
 		// Under five minutes of runtime counts here too. It used to be applied only after this
 		// early return, so a UPS reporting three minutes left and no charge gauge was "unknown".
-		if (!ups.Charge.HasValue && !ups.Degraded && !ups.NeedsNewBattery && !(ups.RunTimeMin is < 5))
+		var runningOut = Steps.ShortRuntime(ups.RunTimeMin, slot.Level);
+		if (!ups.Charge.HasValue && !ups.Degraded && !ups.NeedsNewBattery && !runningOut)
 			return null;
 
 		var severity = ups.Charge.HasValue ? 100 - ups.Charge.Value : 0;
 		// Under five minutes of runtime is red whatever the charge gauge claims.
-		if (ups.RunTimeMin is < 5) severity = Math.Max(severity, CritOf(slot));
+		if (runningOut) severity = Math.Max(severity, CritOf(slot));
 		if (ups.Degraded || ups.NeedsNewBattery) severity = Math.Max(severity, WarnOf(slot));
 		return severity;
 	}
@@ -1833,13 +2192,18 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		var slot = Slot("uptime", UptimeMetric, UptimeGuid);
 		Record(slot, _r.UptimeHours.Value, 0, unit: "ч");   // a long uptime is not an alarm
 		var hours = _r.UptimeHours.Value;
-		var days = (int)(hours / 24);
+		// Rounded once, to whole hours, and split afterwards. The days used to be truncated and
+		// the remainder rounded on its own, which printed "4 сут 24 ч" for the last half hour of
+		// every day while the icon already said 5.
+		var whole = (long)Format.Round(hours);
+		var days = whole / 24;
 		var detail = days > 0
-			? $"{days} сут {(hours - days * 24).ToString("0", CultureInfo.InvariantCulture)} ч без перезагрузки"
+			? $"{days.ToString(CultureInfo.InvariantCulture)} сут {(whole % 24).ToString(CultureInfo.InvariantCulture)} ч без перезагрузки"
 			: $"{hours.ToString("0.0", CultureInfo.InvariantCulture)} ч без перезагрузки";
 		// Severity 0, not null: null is the code for "this source is dead" and would paint the
 		// plate grey for ever. Uptime is never alarming, it just has nothing to warn about.
-		Show(slot, Whole(hours < 99 ? hours : Math.Round(hours / 24)), 0,
+		// Whole() rounds away from zero; Math.Round in front of it rounded the days half to even.
+		Show(slot, Whole(hours < 99 ? hours : hours / 24), 0,
 			detail + (hours >= 99 ? " (на значке — сутки)" : ""));
 	}
 
@@ -1866,7 +2230,8 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			{
 				// Only sources the user called expected count as a gap worth reporting; every
 				// machine is missing some technology, and a fresh install must not look broken.
-				if (candidate.Settings.Required ?? false) silent++;
+				// Nor one whose reader has not answered yet after the machine woke up.
+				if ((candidate.Settings.Required ?? false) && !AwaitingReader(candidate)) silent++;
 				continue;
 			}
 			// Severity comes from Record, not from Show, so an icon the user has hidden still
@@ -1900,9 +2265,12 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 				level: worstLevel);
 			return;
 		}
+		// What matters first and the legend last, as the tail: a tooltip is cut at 127 characters,
+		// and with the legend in the middle a fan or a RAID disk name of 17 characters cut off the
+		// count of silent required sources, and a long adapter name "ПОРОГ ПРЕВЫШЕН" as well.
 		Show(slot, Whole(top), top,
-			$"{LabelOf(worst)} — {Whole(top)} усл. ед. по общей шкале (78 — жёлтый, 100 — красный)" +
-			$"{(top >= 100 ? "   ПОРОГ ПРЕВЫШЕН" : "")}{gaps}",
+			$"{LabelOf(worst)} — {Whole(top)} усл. ед.{(top >= 100 ? "   ПОРОГ ПРЕВЫШЕН" : "")}{gaps}",
+			tail: "\nшкала: 78 — жёлтый, 100 — красный",
 			level: worstLevel);
 	}
 
@@ -1982,7 +2350,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// program at all. Start with the four that answer "is this machine busy", and let the
 		// rest be switched on from the menu. Existing installations are untouched: they have a
 		// settings file already, so this only takes effect on a machine with no TrayMon.json.
-		if (_firstRun && !DefaultOn(slot.Id))
+		if (_firstRun && !DefaultOn(slot))
 		{
 			_config.For(slot.Id).Enabled = false;
 			_configDirty = true;
@@ -1990,12 +2358,39 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		slot.Settings = _config.Get(slot.Id);
 		_slots[slot.Id] = slot;
 		_order.Add(slot);
+		KeepInOrder(slot);
 	}
 
-	/// <summary>The four load meters, and only for the first card: every adapter, every volume and
-	/// every second card would put the count back where it was. "gpu.0" is the load of card 0 —
-	/// its temperature is "gpu.temp.0" and stays off.</summary>
-	private static bool DefaultOn(string id) => id is "cpu" or "ram" or "gpu.0" or "vram.0";
+	/// <summary>
+	/// The four load meters — the GPU ones only for the first card: every adapter, every volume and
+	/// every second card would put the count back where it was — and the summary icon.
+	/// </summary>
+	/// <remarks>
+	/// By family and pool slot, not by id. The id of a card has been the tail of its UUID since
+	/// 1.3.0, and the literals "gpu.0" and "vram.0" here matched nothing: a first run on a machine
+	/// with an NVIDIA card switched both off and wrote that into TrayMon.json, while both README
+	/// versions promised them.
+	///
+	/// The summary icon is on because everything else is off: a UPS asking for a new battery, a
+	/// disk at 60 °C or a full volume would otherwise be in the tray nowhere at all, and that is
+	/// precisely what it is for. It costs no polling — it is computed either way — and one icon;
+	/// in the normal state its text does not change.
+	/// </remarks>
+	private static bool DefaultOn(IconSlot slot) =>
+		slot.Id is "cpu" or "ram" or "worst" ||
+		((ReferenceEquals(slot.Metric, GpuMetric) || ReferenceEquals(slot.Metric, VramMetric)) &&
+		 slot.Guid == slot.Metric.Pool[0]);
+
+	/// <summary>
+	/// Drops a user threshold that is upside down against the built-in one it is paired with, with
+	/// a note in «Диагностика…». See <see cref="Config.KeepInOrder"/>.
+	/// </summary>
+	private void KeepInOrder(IconSlot slot)
+	{
+		if (ReferenceEquals(slot.Metric, DiskMetric) && !slot.LimitsKnown) return;   // see LimitsKnown
+		if (_config.KeepInOrder(slot.Id, DefaultWarn(slot), DefaultCrit(slot))) return;
+		slot.Settings = _config.Get(slot.Id);
+	}
 
 	/// <summary>
 	/// Feeds the five-minute window behind the tooltip and marks the slot alive.
@@ -2119,22 +2514,26 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		var line = $"{DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture)}  {LabelOf(slot)}: " +
 				   $"{Alarm.Name(was)} → {Alarm.Name(level)}" +
 				   (slot.LastText is null ? "" : $" ({slot.LastText})");
-		_journal.Enqueue(line);
+		var required = slot.Settings.Required ?? false;
+		_journal.Enqueue((Environment.TickCount64, level, required, line));
 		while (_journal.Count > 50) _journal.Dequeue();
 		if (_dry) return;
 
 		// Losing a source the user marked as expected is an event in its own right: a grey plate
 		// is easy to miss, and one summary icon can look perfectly healthy while the thing it was
-		// summarising has stopped answering.
-		if (level == Alarm.Dead && was >= Alarm.Normal && (slot.Settings.Required ?? false))
+		// summarising has stopped answering. Marking it required is the consent to hear about it:
+		// the notification setting is about the red, it is off by default on most metrics, and on
+		// volumes and uptime it is not even in the menu — so a required volume that vanished used
+		// to say nothing at all, against the hint of the very menu item that marks it.
+		if (level == Alarm.Dead && was >= Alarm.Normal && required)
 		{
-			Notify(slot, $"{LabelOf(slot)}: данные пропали — {slot.LastDetail}", critical: false);
+			Notify(slot, $"{LabelOf(slot)}: данные пропали — {slot.LastDetail}", critical: false, asked: true);
 			return;
 		}
 		if (level == Alarm.Dead) return;
-		if (was == Alarm.Dead && level >= Alarm.Normal && (slot.Settings.Required ?? false) && level < Alarm.Critical)
+		if (was == Alarm.Dead && level >= Alarm.Normal && required && level < Alarm.Critical)
 		{
-			Notify(slot, $"{LabelOf(slot)}: данные снова есть — {slot.LastDetail}", critical: false);
+			Notify(slot, $"{LabelOf(slot)}: данные снова есть — {slot.LastDetail}", critical: false, asked: true);
 			return;
 		}
 
@@ -2151,10 +2550,12 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// a second path of its own that ignored the "Уведомлять при переходе в красный" setting
 	/// entirely, and could produce two messages for one event.
 	/// </summary>
-	private void Notify(IconSlot slot, string what, bool critical)
+	/// <param name="asked">The user asked for this event by marking the source required, so the
+	/// notification setting — which is about the red — does not filter it.</param>
+	private void Notify(IconSlot slot, string what, bool critical, bool asked = false)
 	{
 		if (_dry) return;
-		if (!(slot.Settings.NotifyOnCritical ?? slot.Metric.NotifyByDefault)) return;
+		if (!asked && !(slot.Settings.NotifyOnCritical ?? slot.Metric.NotifyByDefault)) return;
 		if (slot.NotifiedTick == _tick) return;
 		slot.NotifiedTick = _tick;
 		Balloon("TrayMon", what, warning: critical);
@@ -2184,7 +2585,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			// A real time window now, over readings that carry their own timestamps: the ring of
 			// 150 numbers was five minutes only at the built-in tick rate, and the label said
 			// "5 мин" whatever the tick and however long the session had been locked.
-			var window = slot.Stats.Window(now);
+			var window = slot.Metric.NoStats ? null : slot.Stats.Window(now);
 			slot.StatsText = window is null
 				? ""
 				// Kept short on purpose: a tray tooltip is 127 characters and no more, and a network
@@ -2259,7 +2660,13 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		var lines = new StringBuilder();
 		foreach (var slot in _order)
 		{
-			if (!slot.Severity.HasValue && !slot.LastValue.HasValue) continue;
+			// A source that went quiet after measuring something keeps its rows: empty value and
+			// severity, status "dead" and the moment of its last measurement. This runs after Fade,
+			// which empties both, and the condition used to skip exactly those slots — so "dead" was
+			// never written, and a vanished source simply stopped having rows, which no filter on the
+			// status column can find. "stale" is a slot waiting for its reader after a sleep.
+			if (!slot.Severity.HasValue && !slot.LastValue.HasValue && !(slot.Dead && slot.MeasuredAt != default))
+				continue;
 			var status = slot.Dead ? "dead" : slot.SeenTick == _tick ? "ok" : "stale";
 			lines.Append(stamp).Append(';').Append(Csv.Field(slot.Id)).Append(';')
 				 .Append(slot.LastValue.HasValue ? slot.LastValue.Value.ToString("0.###", ci) : "").Append(';')
@@ -2284,7 +2691,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			// the queue until the next log interval.
 			if (Interlocked.Exchange(ref _logWriting, 1) == 1) return;
 		}
-		Spawn(FlushLog);
+		Spawn(FlushLog, Cost.Log);
 	}
 
 	private void FlushLog()
@@ -2300,6 +2707,16 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 				: Path.IsPathFullyQualified(configured)
 					? configured
 					: Path.Combine(AppContext.BaseDirectory, configured);
+
+			if (LogRefused(path))
+			{
+				lock (_logQueue)
+				{
+					_logQueue.Clear();
+					Volatile.Write(ref _logWriting, 0);
+				}
+				return;
+			}
 
 			while (true)
 			{
@@ -2338,6 +2755,25 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		}
 	}
 
+	/// <summary>
+	/// Whether the trail must not be written where TrayMon.json sends it: the rule smartctl.exe
+	/// already follows. A process with an elevated token appends to that file and renames it to
+	/// <c>.1</c> and <c>.old</c>; in a folder an ordinary user can write to, that user can put a
+	/// junction in its place and send both the writes and the renames anywhere. Refused only when
+	/// the program folder itself is protected — otherwise TrayMon.exe can be replaced just as
+	/// easily, and refusing would only cost the trail. Checked once per path: an ACL does not move.
+	/// </summary>
+	private bool LogRefused(string path)
+	{
+		if (string.Equals(path, _logCheckedPath, StringComparison.OrdinalIgnoreCase)) return _logRefusal is not null;
+		_logCheckedPath = path;
+		_logRefusal = null;
+		if (Autostart.WritableByNonAdmins(AppContext.BaseDirectory, out _)) return false;
+		if (!Autostart.UnsafeToRun(path, out var who)) return false;
+		_logRefusal = $"не пишется: его папку может изменить {who}, а TrayMon работает с правами администратора";
+		return true;
+	}
+
 	/// <summary>Rolls the trail over once it reaches its limit. A monitor that fills the disk it
 	/// is watching is a special kind of useless.</summary>
 	private void Roll(string path)
@@ -2363,7 +2799,9 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private const int ThreadModeBackgroundBegin = 0x00010000;
 	private const int ThreadModeBackgroundEnd = 0x00020000;
 
-	private void Spawn(Action work)
+	/// <param name="cost">Where the cycles of this work go in «Диагностика…».</param>
+	/// <param name="background">Whether the pool thread drops into background mode for it.</param>
+	private void Spawn(Action work, Cost cost, bool background = true)
 	{
 		// The dry run does the work inline, in order, on this thread. It used to skip it entirely
 		// and read the sources itself instead, which meant --once --icons exercised a path the
@@ -2377,11 +2815,13 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			// should ever be ahead of whatever the machine is really doing. The mode is per
 			// thread and this is a pool thread, so it is always ended again.
 			var thread = GetCurrentThread();
-			var lowered = SetThreadPriority(thread, ThreadModeBackgroundBegin);
+			var lowered = background && SetThreadPriority(thread, ThreadModeBackgroundBegin);
 			var started = Stopwatch.GetTimestamp();
+			var cycles = CycleClock.Now();
 			try { work(); }
 			finally
 			{
+				Charge(cost, cycles);
 				Interlocked.Add(ref _poolTicks, Stopwatch.GetTimestamp() - started);
 				if (lowered) SetThreadPriority(thread, ThreadModeBackgroundEnd);
 			}
@@ -2432,8 +2872,10 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		if (Interlocked.Exchange(ref _topIoRefreshRunning, 1) == 1) return;
 		try
 		{
-			// A gap longer than two periods makes the sample a baseline instead of a reading.
-			_r.TopIo = _perf.TopIoProcesses(3, TopIoEveryMs * 2);
+			// A gap longer than two periods makes the sample a baseline instead of a reading — two
+			// ticks, when a tick is longer: with TickMs above 24 s every sample used to be a
+			// baseline, and the process line was never shown at all.
+			_r.TopIo = _perf.TopIoProcesses(3, 2 * Math.Max(TopIoEveryMs, Interval));
 			Volatile.Write(ref _r.TopIoAt, Environment.TickCount64);
 		}
 		catch (Exception ex) { _r.TopIo = new List<(string, double)>(); Trouble(ex); }
@@ -2527,8 +2969,13 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 
 	// ---- settings helpers ----
 
-	private double WarnOf(IconSlot slot) => slot.Settings.Warn ?? slot.Metric.Warn;
-	private double CritOf(IconSlot slot) => slot.Settings.Crit ?? slot.Metric.Crit;
+	private double WarnOf(IconSlot slot) => slot.Settings.Warn ?? DefaultWarn(slot);
+	private double CritOf(IconSlot slot) => slot.Settings.Crit ?? DefaultCrit(slot);
+
+	/// <summary>The thresholds an icon has when the user sets none: the device's own where it
+	/// reports them, the metric's built-in pair otherwise.</summary>
+	private static double DefaultWarn(IconSlot slot) => slot.OwnLimits?.Warn ?? slot.Metric.Warn;
+	private static double DefaultCrit(IconSlot slot) => slot.OwnLimits?.Crit ?? slot.Metric.Crit;
 
 	/// <summary>
 	/// Whether this icon is coloured by its thresholds at all. Switching the highlight off is a
@@ -2570,46 +3017,51 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private IconSettings Own(IconSlot slot) => slot.Settings = _config.For(slot.Id);
 
 	/// <summary>
-	/// Writes the settings, keeping whatever was edited on disk in the meantime.
+	/// Changes one setting of one icon and writes the settings, keeping whatever was edited on disk
+	/// in the meantime.
 	///
 	/// The file is serialised whole, so a menu click between somebody's save in an editor and the
 	/// next debounced reload used to write the in-memory object over their edit and stamp it as
-	/// current. The one setting that was just changed here is carried onto the fresh file instead.
+	/// current. The change itself is what is carried onto the fresh file — not the whole entry of
+	/// the icon, which took back an edit of another field of the same icon (a colour typed into the
+	/// file, then "Уведомлять…" clicked before the reload had picked the colour up).
 	/// </summary>
-	private void Persist(IconSlot slot)
+	private void Persist(IconSlot slot, Action<IconSettings> change)
 	{
-		_config.Tidy(slot.Id);
-		if (_config.ChangedOnDisk)
+		// Also a file that was never read at all: one that failed to load at start and is still
+		// there is not something to write the defaults over.
+		if (_config.MustReadBeforeWrite)
 		{
 			var fresh = Config.Read();
-			if (fresh.LoadError is null)
-			{
-				var mine = _config.Icons.TryGetValue(slot.Id, out var entry) ? entry : null;
-				// Slot assignments are ours, never edited by hand, and must not be lost to a reload.
-				Adopt(fresh);
-				if (mine is null) _config.Icons.Remove(slot.Id);
-				else _config.Icons[slot.Id] = mine;
-				// And the icons follow it: a colour or a caption edited in the file otherwise sat
-				// in memory unapplied, because the save below makes the file look already read.
-				ApplySettings();
-			}
-			else
+			if (fresh.LoadError is not null)
 			{
 				// Not over an edit that cannot be read: the save below went ahead anyway and wrote
 				// the object in memory over a hand edit with one typo in it — with no .bad, because
 				// only the start-up load keeps one and Read must not touch the file. The automatic
 				// writes already refuse here (CatchUpWithFile); a menu click was the one that did not.
-				slot.Settings = _config.Get(slot.Id);
-				Info($"Настройки не сохранены: TrayMon.json изменён и не читается.\n\n{fresh.LoadError}\n\n" +
+				Apply(slot, change);
+				Info($"Настройки не сохранены: TrayMon.json не читается.\n\n{fresh.LoadError}\n\n" +
 					 "Изменение действует до перечитывания настроек или перезапуска программы.",
 					 MessageBoxIcon.Warning);
 				return;
 			}
+			// Slot assignments are ours, never edited by hand, and Adopt keeps them. And the icons
+			// follow the file: a colour or a caption edited in it otherwise sat in memory unapplied,
+			// because the save below makes the file look already read.
+			Adopt(fresh);
+			ApplySettings();
 		}
-		slot.Settings = _config.Get(slot.Id);
+		Apply(slot, change);
 		if (_config.Save(out var error)) return;
 		Info($"Настройки не сохранены: {error}\n\nИзменение действует до перезапуска программы.",
 			MessageBoxIcon.Warning);
+	}
+
+	private void Apply(IconSlot slot, Action<IconSettings> change)
+	{
+		change(_config.For(slot.Id));
+		_config.Tidy(slot.Id);
+		slot.Settings = _config.Get(slot.Id);
 	}
 
 	// ---- tray menu ----
@@ -2666,7 +3118,9 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// a metric that never alarms has no thresholds to type into. The dialog used to
 		// accept "600 rpm" into a scale that only ever holds 0 and 100, which quietly turned
 		// the standstill alarm off while its checkbox still said it was on.
-		if (!clicked.Metric.StallAlarm && clicked.Metric.Warn < NeverAlerts)
+		// Nor on the summary icon: its colour is the worst plate's level, passed in whole, and
+		// thresholds typed here were saved and then had no effect at all.
+		if (!clicked.Metric.StallAlarm && clicked.Metric.Warn < NeverAlerts && !ReferenceEquals(clicked.Metric, WorstMetric))
 			menu.DropDownItems.Add("Пороги…", null, (_, _) => EditThresholds(clicked));
 		if (clicked.Id.StartsWith("free.", StringComparison.Ordinal))
 			menu.DropDownItems.Add("Порог по остатку в ГБ…", null, (_, _) => EditGbThresholds(clicked));
@@ -2688,7 +3142,10 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			{
 				Checked = clicked.Settings.NotifyOnCritical ?? clicked.Metric.NotifyByDefault,
 				CheckOnClick = true,
-				ToolTipText = "Всплывающее уведомление один раз на переход, а не на каждый тик",
+				ToolTipText = "Всплывающее уведомление один раз на переход, а не на каждый тик" +
+							  (ReferenceEquals(clicked.Metric, UpsMetric)
+								  ? "; у ИБП — ещё и переход на батарею, байпас и замена батареи"
+								  : ""),
 			};
 			notify.Click += (_, _) => SetNotify(clicked, notify.Checked);
 			menu.DropDownItems.Add(notify);
@@ -2697,7 +3154,8 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		{
 			Checked = clicked.Settings.Required ?? false,
 			CheckOnClick = true,
-			ToolTipText = "Сообщать о пропаже и возврате данных и считать их в сводном значке",
+			ToolTipText = "Сообщать о пропаже и возврате данных — независимо от «Уведомлять…» — " +
+						  "и считать пробелы в сводном значке",
 		};
 		required.Click += (_, _) => SetRequired(clicked, required.Checked);
 		menu.DropDownItems.Add(required);
@@ -2777,10 +3235,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 				 "Прежние значения оставлены без изменений.", MessageBoxIcon.Warning);
 			return;
 		}
-		var settings = Own(slot);
-		settings.WarnGb = w;
-		settings.CritGb = c;
-		Persist(slot);
+		Persist(slot, s => { s.WarnGb = w; s.CritGb = c; });
 	}
 
 	/// <summary>Menu items are Components; Clear alone leaves each of them to the finaliser,
@@ -2898,14 +3353,12 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 
 	private void SetNotify(IconSlot slot, bool on)
 	{
-		Own(slot).NotifyOnCritical = on == slot.Metric.NotifyByDefault ? null : on;
-		Persist(slot);
+		Persist(slot, s => s.NotifyOnCritical = on == slot.Metric.NotifyByDefault ? null : on);
 	}
 
 	private void SetInk(IconSlot slot, string ink)
 	{
-		Own(slot).Ink = ink;
-		Persist(slot);
+		Persist(slot, s => s.Ink = ink);
 		slot.Icon?.SetInk(InkOf(slot));
 	}
 
@@ -2913,8 +3366,8 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	{
 		using var dialog = new ColorDialog { Color = PlateOf(slot), FullOpen = true, AnyColor = true };
 		if (dialog.ShowDialog() != DialogResult.OK) return;
-		Own(slot).Color = $"#{dialog.Color.R:X2}{dialog.Color.G:X2}{dialog.Color.B:X2}";
-		Persist(slot);
+		var color = $"#{dialog.Color.R:X2}{dialog.Color.G:X2}{dialog.Color.B:X2}";
+		Persist(slot, s => s.Color = color);
 		slot.Icon?.SetPlate(dialog.Color);
 
 		// A plate held at its warning colour ignores the chosen one, which looks like the
@@ -2930,8 +3383,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private void SetAlerts(IconSlot slot, bool on)
 	{
 		// Null rather than true, so an icon nobody has changed keeps no entry in the file at all.
-		Own(slot).Alerts = on ? null : false;
-		Persist(slot);
+		Persist(slot, s => s.Alerts = on ? null : false);
 		Push(slot, slot.LastText, slot.LastSeverity);
 	}
 
@@ -2956,8 +3408,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			var item = new ToolStripMenuItem(label) { Checked = current == choice, ToolTipText = hint };
 			item.Click += (_, _) =>
 			{
-				Own(slot).Stall = choice;
-				Persist(slot);
+				Persist(slot, s => s.Stall = choice);
 				Push(slot, slot.LastText, slot.LastSeverity);
 			};
 			menu.DropDownItems.Add(item);
@@ -2971,8 +3422,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// </summary>
 	private void SetRequired(IconSlot slot, bool required)
 	{
-		Own(slot).Required = required ? true : null;
-		Persist(slot);
+		Persist(slot, s => s.Required = required ? true : null);
 	}
 
 	/// <summary>
@@ -3020,10 +3470,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			return;
 		}
 
-		var settings = Own(slot);
-		settings.Warn = warnStore;
-		settings.Crit = critStore;
-		Persist(slot);
+		Persist(slot, s => { s.Warn = warnStore; s.Crit = critStore; });
 		Push(slot, slot.LastText, slot.LastSeverity);
 	}
 
@@ -3031,8 +3478,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	{
 		var name = Prompt("Подпись значка", LabelOf(slot));
 		if (name is null) return;
-		Own(slot).Label = string.IsNullOrWhiteSpace(name) ? null : name;   // empty restores the default
-		Persist(slot);
+		Persist(slot, s => s.Label = string.IsNullOrWhiteSpace(name) ? null : name);   // empty restores the default
 		slot.Icon?.Update(slot.LastText, slot.Level, Tooltip(slot));
 	}
 
@@ -3060,13 +3506,15 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			return false;
 		}
 
-		Own(slot).Enabled = enabled;
-		Persist(slot);
+		Persist(slot, s => s.Enabled = enabled);
 		if (!enabled)
 		{
 			if (slot.Icon is not null) { slot.Icon.Dispose(); slot.Icon = null; }
 			return true;
 		}
+		// The first volume shown: its process line should not wait twelve seconds for a query
+		// that was not being made while no volume was on screen.
+		if (ReferenceEquals(slot.Metric, VolumeMetric)) _topIoAt = 0;
 		// The user's thresholds and ink, not the built-in ones: creating the icon with
 		// slot.Metric.Warn made a freshly unhidden icon flash yellow for a tick even with the
 		// highlight switched off.
@@ -3090,13 +3538,13 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// device list is wrong and an OID dropped as noSuchName may be there after all.
 		_hdd.Rediscover();
 		_ups.Rediscover();
-		Spawn(RefreshSlow);
-		Spawn(RefreshDisks);
-		Spawn(RefreshRaidDisk);
-		Spawn(RefreshUps);
-		Spawn(RefreshTopIo);
+		Spawn(RefreshSlow, Cost.Sensors, background: false);
+		Spawn(RefreshDisks, Cost.Disks);
+		Spawn(RefreshRaidDisk, Cost.Raid);
+		Spawn(RefreshUps, Cost.Ups);
+		Spawn(RefreshTopIo, Cost.TopIo);
 		var names = _r.Volumes.Select(v => v.Name).ToArray();
-		Spawn(() => RefreshSpace(names));
+		Spawn(() => RefreshSpace(names), Cost.Space);
 		Info("Опрос запущен. Медленные источники (SMART, RAID, ИБП) ответят в течение нескольких секунд.");
 	}
 
@@ -3205,9 +3653,19 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// the last save was lost whenever the file had that pool — after a restart the source then got
 	/// somebody else's GUID, with its tray position and visibility.
 	/// </summary>
+	/// <remarks>
+	/// Except once, after a start on defaults: that table was built with no file behind it, so the
+	/// file's own wins and only what does not contradict it is added — see
+	/// <see cref="Config.AddSlotsFrom"/>.
+	/// </remarks>
 	private void Adopt(Config fresh)
 	{
-		fresh.Slots = _config.Slots;
+		if (_slotsUnread)
+		{
+			fresh.AddSlotsFrom(_config.Slots);
+			_slotsUnread = false;
+		}
+		else fresh.Slots = _config.Slots;
 		if (_config.TakeDirty()) _configDirty = true;
 		_config = fresh;
 	}
@@ -3219,9 +3677,15 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// yet — and the reload then saw our own stamp and never noticed. False when the file has changed
 	/// but cannot be read, an editor half-way through a save: nothing may be written over it then.
 	/// </summary>
+	/// <remarks>
+	/// "Changed" includes "never read": a file that failed to load at start and stayed where it
+	/// was. It used to count as unchanged, and the scheduled save on the fifteenth tick wrote the
+	/// defaults over the only copy of somebody's settings. Once it reads, it is taken in like any
+	/// other edit.
+	/// </remarks>
 	private bool CatchUpWithFile()
 	{
-		if (!_config.ChangedOnDisk) return true;
+		if (!_config.MustReadBeforeWrite) return true;
 		var fresh = Config.Read();
 		if (fresh.LoadError is not null) return false;
 		Adopt(fresh);
@@ -3240,9 +3704,11 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// <summary>Hands the settings now in <c>_config</c> to every slot and every live icon.</summary>
 	private void ApplySettings()
 	{
+		_topIoAt = 0;   // a volume may have been switched on in the file; see SetEnabled
 		foreach (var slot in _order)
 		{
 			slot.Settings = _config.Get(slot.Id);
+			KeepInOrder(slot);
 			if (!slot.Settings.Enabled)
 			{
 				if (slot.Icon is not null) { slot.Icon.Dispose(); slot.Icon = null; }
@@ -3312,8 +3778,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			{
 				text.AppendLine("По остроте состояния (усл. ед.: 78 — жёлтый порог метрики, 100 — красный)");
 				foreach (var slot in _order.OrderByDescending(s => Score(s) ?? -1))
-					text.AppendLine($"    {Rank(slot),4}  {State(slot)}  {LabelOf(slot),-32} " +
-									$"{(slot.LastText ?? "—"),6} {slot.LastUnit,-7} {Detail(slot)}");
+					text.AppendLine($"    {Rank(slot),4}  {State(slot)}  {LabelOf(slot),-32} {Reading(slot)} {Detail(slot)}");
 			}
 			else
 			{
@@ -3323,8 +3788,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 					if (members.Count == 0) continue;
 					text.AppendLine(group);
 					foreach (var slot in members)
-						text.AppendLine($"    {State(slot)}  {LabelOf(slot),-32} {(slot.LastText ?? "—"),6} " +
-										$"{slot.LastUnit,-7} {Detail(slot)}");
+						text.AppendLine($"    {State(slot)}  {LabelOf(slot),-32} {Reading(slot)} {Detail(slot)}");
 					text.AppendLine();
 				}
 			}
@@ -3335,6 +3799,19 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			TextWindow("TrayMon — сводка", text.ToString());
 		}
 		finally { _summaryOpen = false; }
+	}
+
+	/// <summary>
+	/// Value and unit for the summary window: the number itself with the unit it is in, which is
+	/// what the CSV trail writes too. The plate's text used to go next to that unit — and the plate
+	/// changes unit under its own feet, so a fan read "1.2 об/мин", 1.5 TB free read "1.5 ГБ".
+	/// What has no number of its own (the summary icon) keeps its plate text.
+	/// </summary>
+	private static string Reading(IconSlot slot)
+	{
+		if (!slot.LastValue.HasValue) return $"{slot.LastText ?? "—",8} {"",-7}";
+		var value = slot.LastValue.Value;
+		return $"{value.ToString(Digits(value), CultureInfo.InvariantCulture),8} {slot.LastUnit,-7}";
 	}
 
 	private string Rank(IconSlot slot)
@@ -3466,25 +3943,47 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			text.AppendLine($"рабочее множество:{(_self.WorkingSet64 / 1048576.0).ToString("0", ci)} МБ");
 		}
 		catch (Exception ex) { text.AppendLine($"процессор всего:  не прочитан — {ex.Message}"); }
+		Shares(text);
 		text.AppendLine($"отрисовок:        {TrayValueIcon.Renders.ToString(ci)}");
 		text.AppendLine($"вызовов в трей:   {TrayValueIcon.ShellCalls.ToString(ci)} " +
 						$"({(_tick > 0 ? (TrayValueIcon.ShellCalls / (double)_tick) : 0).ToString("0.00", ci)} на тик)");
 		text.AppendLine($"ошибок за сеанс:  {_tickErrors.ToString(ci)}");
 		if (_logDropped > 0)
 			text.AppendLine($"журнал CSV:       строк потеряно {_logDropped.ToString(ci)} — запись не успевает");
+		if (_config.Log.Enabled && _logRefusal is { } refusal)
+			text.AppendLine($"журнал CSV:       {refusal}");
 		if (_lastTickError is not null) text.AppendLine($"последняя:        {_lastTickError}");
 		if (WindowsLog.LastError is not null) text.AppendLine($"                  {WindowsLog.LastError}");
 		if (_journal.Count > 0)
 		{
 			text.AppendLine();
 			text.AppendLine("переходы тревог (последние):");
-			foreach (var line in _journal) text.AppendLine("    " + line);
+			foreach (var entry in _journal) text.AppendLine("    " + entry.Line);
 		}
 		TextWindow("TrayMon — диагностика", text.ToString());
 	}
 
+	/// <summary>
+	/// What the program's own cycles went to, by source, as shares of all that were counted. A hint
+	/// where to look — the paired <c>--measure</c> run is still what decides — and shares rather than
+	/// milliseconds: cycles do not convert to time on a CPU whose clock moves.
+	/// </summary>
+	private void Shares(StringBuilder text)
+	{
+		var ci = CultureInfo.InvariantCulture;
+		var parts = new List<(string Name, long Cycles)>(CostNames.Length + 1);
+		for (var i = 0; i < CostNames.Length; i++) parts.Add((CostNames[i], Interlocked.Read(ref _cycles[i])));
+		parts.Add(("отрисовка и вызовы в оболочку", Interlocked.Read(ref TrayValueIcon.Cycles)));
+		var total = parts.Sum(p => Math.Max(0, p.Cycles));
+		if (total <= 0) return;
+		text.AppendLine("  по источникам — доля учтённых циклов; не входят GC, цикл сообщений, а также");
+		text.AppendLine("  explorer.exe, smartctl.exe и SNMP-агент: это другие процессы");
+		foreach (var (name, cycles) in parts.Where(p => p.Cycles > 0).OrderByDescending(p => p.Cycles))
+			text.AppendLine($"    {name,-38} {(100.0 * cycles / total).ToString("0.0", ci),5} %");
+	}
+
 	/// <summary>One line about a background source: how old its snapshot is and when it is due.</summary>
-	private static void Age(StringBuilder text, string what, long measuredAt, long nextAt, int periodMs)
+	private void Age(StringBuilder text, string what, long measuredAt, long nextAt, int periodMs)
 	{
 		var ci = CultureInfo.InvariantCulture;
 		var now = Environment.TickCount64;
@@ -3759,6 +4258,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			{
 				Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
 				Microsoft.Win32.SystemEvents.SessionEnding -= OnSessionEnding;
+				Microsoft.Win32.SystemEvents.SessionEnded -= OnSessionEnded;
 			}
 
 			// Wait for the background readers first. Closing the sensor library unloads a ring-0
@@ -3790,6 +4290,11 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 				_lhm?.Dispose();
 			}
 			_self?.Dispose();
+			if (!_dry && Interlocked.Exchange(ref _stopLogged, 1) == 0)
+				WindowsLog.Note("TrayMon остановлен." + (_lhm?.LeftOpen == true
+					? " Драйвер датчиков не выгружен: запрос к накопителю не завершился, " +
+					  "драйвер останется загруженным до перезагрузки."
+					: ""));
 		}
 		base.Dispose(disposing);
 	}

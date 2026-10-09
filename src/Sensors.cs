@@ -15,6 +15,18 @@ public sealed record GpuReading(
 	/// and the settings — colour, caption, thresholds — then belonged to a different card.
 	/// </summary>
 	public string Key { get; init; }
+
+	/// <summary>
+	/// NVML return code of each value that did not come back, zero when it did. A card answering
+	/// memory and temperature but not utilization counts as answering, and the error text the
+	/// sensor keeps is cleared on such a poll — so the grey load icon used to blame a missing
+	/// NVIDIA driver while the VRAM and temperature icons of the same card were reading fine.
+	/// </summary>
+	public int LoadCode { get; init; }
+
+	public int MemCode { get; init; }
+
+	public int TempCode { get; init; }
 }
 
 /// <summary>
@@ -22,7 +34,14 @@ public sealed record GpuReading(
 /// <c>smart_status.passed = false</c> without a temperature was dropped from the list entirely,
 /// so the one answer that matters most produced no icon and no alarm at all.
 /// </summary>
-public sealed record RaidDisk(string Name, double? Temp, string Serial, string Health);
+public sealed record RaidDisk(string Name, double? Temp, string Serial, string Health)
+{
+	/// <summary>
+	/// The disk is spun down and was left so: smartctl stops at the power check, before it has
+	/// read anything, so the name, serial and health are those of its last answer awake.
+	/// </summary>
+	public bool Asleep { get; init; }
+}
 
 /// <summary>
 /// One directly attached disk: temperature, and the NVMe wear figures when the sensor library
@@ -40,6 +59,10 @@ public sealed record DiskReading(string Name, double Temp, double? WearPercent, 
 
 	/// <summary>Wear or spare capacity past the point where the drive is expected to fail.</summary>
 	public bool Worn => WearPercent >= 95 || SparePercent is >= 0 and < 10;
+
+	/// <summary>The drive's own warning and critical temperature, when it reports a sane pair.
+	/// See <see cref="StorageTemperature.Limits"/>.</summary>
+	public (double Warn, double Crit)? Limits { get; init; }
 }
 
 /// <summary>Battery of a laptop or tablet, as Windows reports it.</summary>
@@ -96,12 +119,22 @@ public sealed class UpsReading
 	public int? Status;
 
 	/// <summary>
-	/// Running on battery. Only 3 (onBattery) and 15 (onBatteryTest) mean that; 1 (unknown) means
-	/// nothing is known and must not be reported as mains power. Everything that was not 3 used to
-	/// read as "on line", which turned a UPS in hardware-failure bypass — and one that answered
-	/// "unknown" — into a green plate.
+	/// Running on battery because the mains is gone. Only 3 (onBattery) means that; 1 (unknown)
+	/// means nothing is known and must not be reported as mains power. Everything that was not 3
+	/// used to read as "on line", which turned a UPS in hardware-failure bypass — and one that
+	/// answered "unknown" — into a green plate.
 	/// </summary>
-	public bool? OnBattery => Status switch { 3 or 15 => true, null or 1 => null, _ => false };
+	/// <remarks>
+	/// 15 (onBatteryTest) is not an outage. The load is on the battery by design, a self-test only
+	/// runs with the mains present, and PowerChute schedules one every couple of weeks: counting it
+	/// sent "ИБП перешёл на батарею" with an Error event into the log a server's monitoring reads,
+	/// and "Питание от сети восстановлено" one poll later, for a mains that had never gone.
+	/// </remarks>
+	public bool? OnBattery => Status switch { 3 => true, null or 1 => null, _ => false };
+
+	/// <summary>The load is going through a bypass instead of the inverter: the UPS will not carry
+	/// it through the next outage.</summary>
+	public bool Bypass => Status is 6 or 9 or 10 or 16 or 17;
 
 	/// <summary>
 	/// Working, but not the way it should be: AVR trimming or boosting the mains, or the load
@@ -410,8 +443,11 @@ public sealed class GpuSensor : IDisposable
 				// every machine without an NVIDIA driver, which is the ordinary case, a DLL dropped
 				// next to TrayMon.exe would have been loaded into a process holding an elevated
 				// token. That is precisely what naming the absolute paths was for.
+				// Named relative to their known folders: this text reaches --once, whose output is
+				// promised to carry no absolute paths.
 				throw new DllNotFoundException(
-					"nvml.dll не найдена по доверенным путям (" + string.Join("; ", known) + ")");
+					@"nvml.dll не найдена по доверенным путям (System32\nvml.dll; " +
+					@"%ProgramFiles%\NVIDIA Corporation\NVSMI\nvml.dll)");
 			});
 		}
 		catch (Exception) { /* already set, or the runtime refused — default probing then */ }
@@ -583,6 +619,7 @@ public sealed class GpuSensor : IDisposable
 		double usedGb = 0, totalGb = 0;
 
 		status = NvmlGetUtilization(card.Handle, out var util);
+		var utilRc = status;
 		if (status == 0) load = util.Gpu;
 		else if (status is NvmlGpuIsLost or NvmlUninitialized or NvmlUnknown)
 			// "No NVIDIA driver" is what the icon used to say here, and it was wrong in the one
@@ -640,6 +677,9 @@ public sealed class GpuSensor : IDisposable
 		return new GpuReading(card.Index, card.Name, load, temp, fanRpm, fanDuty, memLoad, usedGb, totalGb)
 		{
 			Key = card.Key,
+			LoadCode = load.HasValue ? 0 : utilRc,
+			MemCode = memLoad.HasValue ? 0 : memRc == 0 ? NvmlUnknown : memRc,
+			TempCode = tempRc,
 		};
 	}
 
@@ -657,16 +697,29 @@ public sealed class GpuSensor : IDisposable
 /// enabled here: LibreHardwareMonitor spends ~68 ms per GPU update, while NVML answers in ~3 ms.
 /// HDDs behind the Intel RAID volume are invisible here — nothing in the stack exposes them.
 ///
-/// Every read is serialised: one <c>Computer</c> is one handle to a ring-0 driver with shared
-/// buffers, and the CPU path switches thread affinity — none of it is documented as safe to
-/// enter from two threads, and the schedules do land on the same tick.
+/// The CPU and the board are read under one lock: one <c>Computer</c> is one handle to a ring-0
+/// driver with shared buffers, and the CPU path switches thread affinity — none of it is
+/// documented as safe to enter from two threads, and the schedules do land on the same tick.
+/// The drives are read under a lock of their own. Their path touches neither the ring-0 driver
+/// nor the affinity — every drive is a storage handle of its own and a DeviceIoControl with no
+/// time limit — and sharing the lock meant one SMART query hanging on a dying disk or a USB
+/// bridge greyed out the CPU temperature and every fan for as long as it hung.
 /// </summary>
 public sealed class LhmSensor : IDisposable
 {
+	/// <summary>How long closing the library waits for a read still in flight. Past it the
+	/// library is left open: unloading it under a query is how the process went down on exit.</summary>
+	private const int CloseWaitMs = 3000;
+
 	private readonly Computer _computer;
 	private readonly object _gate = new();
+	private readonly object _storageGate = new();
 	private readonly List<DiskReading> _disks = new();
-	private bool _closed;
+	private volatile bool _closed;
+
+	/// <summary>Set when <see cref="Dispose"/> gave up waiting for a read and did not close the
+	/// library — its ring-0 driver then stays loaded until the machine restarts.</summary>
+	public bool LeftOpen { get; private set; }
 
 	public bool Available { get; }
 
@@ -725,7 +778,9 @@ public sealed class LhmSensor : IDisposable
 		}
 		catch (Exception ex)
 		{
-			Available = false;   // not elevated, or the driver refused to load
+			// The library itself refused to open. Not "not elevated": without an elevated token it
+			// opens perfectly well and then reads nothing — Probe() and SensorHint() say that one.
+			Available = false;
 			LastError = ex.GetType().Name + ": " + ex.Message;
 		}
 	}
@@ -921,17 +976,31 @@ public sealed class LhmSensor : IDisposable
 	/// rarely. A disk running out of spare blocks matters more than a warm one, which is the
 	/// same argument that already put the SMART verdict on the RAID icons.
 	/// </summary>
-	public void RefreshDiskTemps()
+	/// <param name="answered">Whether the storage driver has already given this drive's
+	/// temperature. Such a drive is asked here only for its wear figures — an NVMe log page — and
+	/// a drive without them is not asked at all.</param>
+	/// <remarks>
+	/// Every drive used to get a SMART read every 62 seconds, and for a SATA disk the driver had
+	/// answered, all of it was thrown away: the merge takes only wear and spare from here, and SATA
+	/// has neither. A SMART command is also what spins a parked hard disk up — the reason smartctl
+	/// has <c>-n standby</c> — so a disk that was meant to sleep after twenty idle minutes never did.
+	/// </remarks>
+	public void RefreshDiskTemps(Func<string, bool> answered = null)
 	{
 		if (!Available) return;
 		var fresh = new List<DiskReading>();
-		lock (_gate)
+		lock (_storageGate)
 		{
 			if (_closed) return;
 			try
 			{
 				foreach (var hw in _computer.Hardware.Where(h => h.HardwareType == HardwareType.Storage))
 				{
+					// The wear sensors exist from the moment the library opens the drive (NVMe
+					// creates them in its constructor), so this is known before anything is read.
+					var wears = hw.Sensors.Any(s => s.SensorType == SensorType.Level &&
+													(s.Name == "Percentage Used" || s.Name == "Available Spare"));
+					if (!wears && answered is not null && answered(hw.Name)) continue;
 					hw.Update();
 					var t = hw.Sensors.FirstOrDefault(s => s.SensorType == SensorType.Temperature && s.Name == "Temperature");
 					if (t?.Value is null) continue;
@@ -960,15 +1029,24 @@ public sealed class LhmSensor : IDisposable
 
 	public void Dispose()
 	{
-		if (!Available) return;
-		// Under the same lock as the reads: closing the library unloads the ring-0 driver, and
-		// doing that while a SMART query is in flight on another thread is how it takes the
-		// process down on exit.
-		lock (_gate)
+		if (!Available || _closed) return;
+		// Under both locks of the reads: closing the library unloads the ring-0 driver and disposes
+		// the drive handles, and doing that while a query is in flight on another thread is how it
+		// took the process down on exit. But not at any price: a DeviceIoControl hung on a dying
+		// disk never returns, and waiting for it without a limit left a process with no icons still
+		// holding the single-instance mutex — "TrayMon is already running", with nothing to see.
+		var storage = Monitor.TryEnter(_storageGate, CloseWaitMs);
+		var board = Monitor.TryEnter(_gate, CloseWaitMs);
+		try
 		{
-			if (_closed) return;
 			_closed = true;
+			if (!storage || !board) { LeftOpen = true; return; }
 			try { _computer.Close(); } catch (Exception) { /* going away anyway */ }
+		}
+		finally
+		{
+			if (board) Monitor.Exit(_gate);
+			if (storage) Monitor.Exit(_storageGate);
 		}
 	}
 }

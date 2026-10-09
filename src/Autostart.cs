@@ -517,6 +517,13 @@ internal static class Autostart
 	/// the obvious move: D:\Tools\TrayMon can carry a perfect ACL and still be renamed out of
 	/// the way, and a replacement put in its place, by anyone who may write into D:\Tools.
 	/// </summary>
+	/// <remarks>
+	/// The walk follows the path as written, so a junction or a symbolic link in it is checked too:
+	/// <c>D:\Apps</c> pointing at <c>E:\Shared\tools</c> used to pass on the ACLs of <c>D:\</c>,
+	/// while whoever may rename things in <c>E:\Shared</c> could swap the executable after the task
+	/// was created. Both chains are walked, and a path whose real location cannot be found out is
+	/// treated like an ACL that cannot be read.
+	/// </remarks>
 	public static bool WritableByNonAdmins(string folder, out string who)
 	{
 		who = null;
@@ -524,14 +531,16 @@ internal static class Autostart
 		if (string.IsNullOrEmpty(folder)) return false;
 		try
 		{
-			var here = true;
-			for (var dir = new DirectoryInfo(folder); dir is not null; dir = dir.Parent, here = false)
+			if (LooseChain(folder, out who)) return true;
+			var real = FinalPath(folder);
+			if (real is null)
 			{
-				if (!Loose(dir, here ? DangerousHere : DangerousAbove, out var identity)) continue;
-				who = here ? identity : $"{identity} — в родительской папке {dir.FullName}";
-				return true;
+				LastCheckError = "не удалось узнать, куда на самом деле ведёт путь " + folder;
+				return false;
 			}
-			return false;
+			if (Same(real, folder) || !LooseChain(real, out var realWho)) return false;
+			who = $"{realWho} — путь ведёт в {real}";
+			return true;
 		}
 		catch (Exception ex)
 		{
@@ -541,6 +550,57 @@ internal static class Autostart
 			return false;
 		}
 	}
+
+	/// <summary>The folder and every folder above it, as written.</summary>
+	private static bool LooseChain(string folder, out string who)
+	{
+		who = null;
+		var here = true;
+		for (var dir = new DirectoryInfo(folder); dir is not null; dir = dir.Parent, here = false)
+		{
+			if (!Loose(dir, here ? DangerousHere : DangerousAbove, out var identity)) continue;
+			who = here ? identity : $"{identity} — в родительской папке {dir.FullName}";
+			return true;
+		}
+		return false;
+	}
+
+	private const uint FileReadAttributes = 0x80, ShareAll = 7, OpenExistingFile = 3;
+	private const uint BackupSemantics = 0x02000000;   // lets CreateFile open a directory
+
+	[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+	private static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security,
+											 uint disposition, uint flags, IntPtr template);
+
+	[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+	private static extern uint GetFinalPathNameByHandleW(IntPtr handle, char[] path, uint length, uint flags);
+
+	[DllImport("kernel32.dll")]
+	[return: MarshalAs(UnmanagedType.Bool)]
+	private static extern bool CloseHandle(IntPtr handle);
+
+	/// <summary>Where a path really leads once every junction and symbolic link in it is followed,
+	/// or null when that cannot be found out.</summary>
+	private static string FinalPath(string path)
+	{
+		var handle = CreateFileW(path, FileReadAttributes, ShareAll, IntPtr.Zero, OpenExistingFile,
+								 BackupSemantics, IntPtr.Zero);
+		if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return null;
+		try
+		{
+			var buffer = new char[1024];
+			var length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Length, 0);
+			if (length == 0 || length >= buffer.Length) return null;
+			var text = new string(buffer, 0, (int)length);
+			if (text.StartsWith(@"\\?\UNC\", StringComparison.Ordinal)) return @"\\" + text.Substring(8);
+			return text.StartsWith(@"\\?\", StringComparison.Ordinal) ? text.Substring(4) : text;
+		}
+		finally { CloseHandle(handle); }
+	}
+
+	private static bool Same(string a, string b) =>
+		string.Equals(Path.GetFullPath(a).TrimEnd('\\'), Path.GetFullPath(b).TrimEnd('\\'),
+					  StringComparison.OrdinalIgnoreCase);
 
 	/// <summary>
 	/// Whether this file could be replaced by somebody who is not an administrator — either
@@ -567,6 +627,22 @@ internal static class Autostart
 			{
 				who = $"{fileWho} — у самого файла {info.Name}";
 				return true;
+			}
+			// A symbolic link to a file elsewhere: what can replace it is the folder it leads to.
+			if (info.Exists)
+			{
+				var real = FinalPath(file);
+				if (real is null)
+				{
+					LastCheckError = folderError ?? "не удалось узнать, куда на самом деле ведёт " + file;
+					return false;
+				}
+				if (!Same(real, file) && WritableByNonAdmins(Path.GetDirectoryName(real), out var realWho))
+				{
+					who = $"{realWho} — файл ведёт в {real}";
+					return true;
+				}
+				folderError ??= LastCheckError;
 			}
 		}
 		catch (Exception ex)

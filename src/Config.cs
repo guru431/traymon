@@ -1,3 +1,4 @@
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -273,6 +274,12 @@ public sealed class Config : IGuidStore
 	// to edit by hand, and the strict defaults silently dropped whatever did not match exactly:
 	// a lower-case "warn" was ignored and then erased by the next Save, and a trailing comma or
 	// a // comment threw the whole file out and renamed it to .bad.
+	//
+	// Cyrillic is written as itself. The default encoder escapes everything outside Basic Latin, so
+	// a caption typed into "Переименовать…" landed in the file as Пр… — the one setting
+	// the user chose themselves was the one they could not read. The relaxed encoder is safe here:
+	// the file never ends up inside HTML, and Create(BasicLatin, Cyrillic) would still have escaped
+	// '+' and '&'.
 	private static readonly JsonSerializerOptions JsonOptions = new()
 	{
 		WriteIndented = true,
@@ -280,6 +287,7 @@ public sealed class Config : IGuidStore
 		PropertyNameCaseInsensitive = true,
 		ReadCommentHandling = JsonCommentHandling.Skip,
 		AllowTrailingCommas = true,
+		Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
 	};
 
 	private int _tickMs = 2000;
@@ -331,7 +339,14 @@ public sealed class Config : IGuidStore
 	/// <summary>The file was read, but something in it had to be adjusted or ignored. Shown by
 	/// <c>--once</c> and in the diagnostics window; never a dialog.</summary>
 	[JsonIgnore]
-	public string LoadNote { get; private set; }
+	public string LoadNote => _skipped.Count == 0
+		? null
+		: "файл прочитан, но непригодные значения пропущены (" + string.Join(", ", _skipped) +
+		  ") — остальные настройки взяты из файла";
+
+	/// <summary>What was dropped, by <see cref="Validate"/> on reading and by
+	/// <see cref="KeepInOrder"/> once the built-in half of a threshold pair is known.</summary>
+	private readonly List<string> _skipped = new();
 
 	/// <summary>Write time of the file this object was read from, so an edit made behind our
 	/// back can be noticed instead of being silently overwritten.</summary>
@@ -348,6 +363,20 @@ public sealed class Config : IGuidStore
 			catch (Exception) { return false; }
 		}
 	}
+
+	/// <summary>
+	/// True when the file on disk has to be read before anything is written over it: it was edited
+	/// since it was read, or it was never read at all — it failed to load and is still there.
+	/// </summary>
+	/// <remarks>
+	/// <see cref="ChangedOnDisk"/> alone missed the second case. A file that failed to load and
+	/// stayed in place (a <c>.bad</c> already existed, the error was not one of JSON, the move
+	/// aside failed) carries its own write time in <see cref="Stamp"/>, so it did not count as
+	/// changed — and the first scheduled save wrote the defaults over the only copy of somebody's
+	/// settings, while the dialog on the second tick was still telling them the file was untouched.
+	/// </remarks>
+	[JsonIgnore]
+	public bool MustReadBeforeWrite => ChangedOnDisk || (LoadError is not null && File.Exists(Path));
 
 	/// <summary>
 	/// Reads the file at startup, and moves an unreadable one aside so the next Save does not
@@ -383,7 +412,7 @@ public sealed class Config : IGuidStore
 					config.Icons[key] = new IconSettings();
 				foreach (var key in config.Slots.Where(p => p.Value is null).Select(p => p.Key).ToList())
 					config.Slots[key] = new Dictionary<string, string>(StringComparer.Ordinal);
-				config.LoadNote = config.Validate();
+				config.Validate();
 				config.Stamp = File.GetLastWriteTimeUtc(Path);
 				return config;
 			}
@@ -430,13 +459,17 @@ public sealed class Config : IGuidStore
 	/// <summary>
 	/// Drops the values that would break the program rather than configure it, and says which.
 	/// The same rules the threshold dialog applies, because a hand-edited file reaches exactly
-	/// the same places: <c>NaN</c> and <c>Infinity</c> parse happily out of JSON and then compare
-	/// false against everything, and a pair with the red threshold below the yellow one painted a
-	/// red plate while the summary icon refused to score it at all.
+	/// the same places: a number outside 0…1e6 — an overflowing <c>1e400</c> included, which the
+	/// reader turns into an infinity — and a pair with the red threshold below the yellow one,
+	/// which painted a red plate while the summary icon refused to score it at all.
 	/// </summary>
-	private string Validate()
+	/// <remarks>
+	/// <c>NaN</c> and <c>Infinity</c>, as a literal or as a string, never get this far: the strict
+	/// number handling of System.Text.Json refuses them, and the file is then not read at all —
+	/// <see cref="LoadError"/>, and on start-up a <c>.bad</c>.
+	/// </remarks>
+	private void Validate()
 	{
-		var dropped = new List<string>();
 		foreach (var (id, s) in Icons)
 		{
 			if (s is null) continue;
@@ -456,22 +489,70 @@ public sealed class Config : IGuidStore
 
 			if (!Sane(s.Warn) || !Sane(s.Crit) || (s.Warn.HasValue && s.Crit.HasValue && s.Warn >= s.Crit))
 			{
-				if (s.Warn.HasValue || s.Crit.HasValue) dropped.Add(id + ": пороги");
+				if (s.Warn.HasValue || s.Crit.HasValue) _skipped.Add(id + ": пороги");
 				s.Warn = null;
 				s.Crit = null;
 			}
 			if (!Sane(s.WarnGb) || !Sane(s.CritGb) || (s.WarnGb.HasValue && s.CritGb.HasValue && s.WarnGb <= s.CritGb))
 			{
 				// Gigabytes left, so the red threshold is the *lower* number here.
-				if (s.WarnGb.HasValue || s.CritGb.HasValue) dropped.Add(id + ": пороги в ГБ");
+				if (s.WarnGb.HasValue || s.CritGb.HasValue) _skipped.Add(id + ": пороги в ГБ");
 				s.WarnGb = null;
 				s.CritGb = null;
 			}
 		}
-		return dropped.Count == 0
-			? null
-			: "файл прочитан, но непригодные значения пропущены (" + string.Join(", ", dropped) +
-			  ") — остальные настройки взяты из файла";
+	}
+
+	/// <summary>
+	/// Drops this icon's thresholds when, together with the built-in ones they are paired with,
+	/// they are upside down — and says so in <see cref="LoadNote"/>.
+	/// </summary>
+	/// <remarks>
+	/// <see cref="Validate"/> can only judge a pair when the file carries both halves, and the
+	/// built-in half is known only to the caller. A lone <c>"Crit": 50</c> on a RAID disk, whose
+	/// built-in yellow is 55, passed it: <see cref="Alarm.LevelOf"/> then called every reading
+	/// normal — a disk failing its SMART verdict included — with no note anywhere.
+	/// </remarks>
+	/// <param name="warn">The yellow threshold this icon has when the user sets none.</param>
+	/// <param name="crit">The red one.</param>
+	/// <returns>False when something was dropped.</returns>
+	public bool KeepInOrder(string id, double warn, double crit)
+	{
+		if (!Icons.TryGetValue(id, out var s) || (s.Warn is null && s.Crit is null)) return true;
+		if ((s.Warn ?? warn) < (s.Crit ?? crit)) return true;
+		s.Warn = null;
+		s.Crit = null;
+		var note = id + ": пороги";
+		if (!_skipped.Contains(note)) _skipped.Add(note);
+		return false;
+	}
+
+	/// <summary>
+	/// Adds the identities handed out in memory that this file does not contradict: a key the
+	/// file does not know, holding a GUID nobody in the file is remembered by.
+	/// </summary>
+	/// <remarks>
+	/// For a process that started on defaults because the file could not be read: its pools handed
+	/// identities out in the order the sources happened to answer, with no history behind them. Taking
+	/// that table over a file restored afterwards — which is what a reload otherwise does — threw the
+	/// real history away at the first save, and two sources of one pool kept each other's GUID, with
+	/// the tray position and visibility that go with it.
+	/// </remarks>
+	internal void AddSlotsFrom(Dictionary<string, Dictionary<string, string>> memory)
+	{
+		foreach (var (pool, table) in memory)
+		{
+			foreach (var (key, text) in table)
+			{
+				var known = Pool(pool, create: false);
+				if (known is not null &&
+					(known.ContainsKey(key) ||
+					 known.Values.Any(v => string.Equals(v, text, StringComparison.OrdinalIgnoreCase))))
+					continue;
+				Pool(pool, create: true)[key] = text;
+				_dirty = true;
+			}
+		}
 	}
 
 	/// <summary>A threshold has to be a finite number in a range a metric can reach.</summary>

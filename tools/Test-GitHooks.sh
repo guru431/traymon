@@ -14,7 +14,7 @@
 #      and a clean verdict.
 #   3. `pre-push` excluded all of `.githooks/*` from the detailed pass, while
 #      `pre-commit` excludes only `_scan.sh` — a token pasted into a hook was
-#      published without a word.
+#      published without a word. Case 8 is the one that catches it coming back.
 #
 # Run (Git Bash on Windows, or any POSIX sh):
 #     sh tools/Test-GitHooks.sh
@@ -109,7 +109,23 @@ printf 'refs/tags/v0.0.1-test %s refs/tags/v0.0.1-test %s\n' "$tag" "$zero" \
   | ( cd "$repo" && sh "$hooks/pre-push" origin https://example.invalid/x.git ) >/dev/null 2>&1 || rc=$?
 check "pre-push: token in an annotated tag message is refused" 1 "$rc"
 
-# 8) Every LINE of .sanitize-patterns is its own pattern. `grep -Ef` reads the file that way,
+# 8) Regression 3 itself: a token in a blob under .githooks/ other than _scan.sh, refused by
+#    pre-push. Case 4 only shows pre-commit refusing it, so with pre-push back on `.githooks/*)
+#    continue` everything here stayed green. --no-verify is how such a commit gets past the
+#    local hooks in the first place. Dropped again afterwards, so nothing below sees it.
+mkdir -p "$repo/.githooks"
+echo "example: $token" > "$repo/.githooks/notes.txt"
+git -C "$repo" add .githooks/notes.txt
+git -C "$repo" commit -q --no-verify -m "add hook notes" >/dev/null 2>&1
+head=$(git -C "$repo" rev-parse HEAD)
+rc=0
+printf 'refs/heads/main %s refs/heads/main %s\n' "$head" "$zero" \
+  | ( cd "$repo" && sh "$hooks/pre-push" origin https://example.invalid/x.git ) >/dev/null 2>&1 || rc=$?
+check "pre-push: token in .githooks/<other file> is refused" 1 "$rc"
+git -C "$repo" reset -q --hard HEAD~1
+rm -rf "$repo/.githooks"
+
+# 9) Every LINE of .sanitize-patterns is its own pattern. `grep -Ef` reads the file that way,
 #    and the hook pipes it through `tr` first — one character away from deleting the newlines
 #    instead of the CRs and leaving a single pattern, the concatenation of all of them, that
 #    matches nothing. The hook would still report a completed check, which is how this was read
@@ -133,7 +149,7 @@ rc=0
 check "pre-commit: content matching no denylist line is accepted" 0 "$rc"
 git -C "$repo" reset -q
 
-# 9) A denylist that exists but cannot be read refuses the commit. Preparing the list hid the read
+# 10) A denylist that exists but cannot be read refuses the commit. Preparing the list hid the read
 #    error behind `2>/dev/null ... || true`: the unreadable file became an empty list, the personal
 #    check was skipped without a word, and the very value it lists went in. A deny ACE on Windows
 #    (chmod does not take read away from the owner on NTFS), mode 000 elsewhere; an account that

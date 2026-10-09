@@ -136,6 +136,65 @@ public sealed class GuidPoolTests
 		Assert.Null(store.OwnerOf("vol", only.Value));
 		Assert.Equal(only, pool.For("D:"));
 	}
+
+	/// <summary>
+	/// Devices that come and go between runs. Release() only forgets what one process handed out,
+	/// so a device absent at the next start kept its record for ever, and the second pass wrote the
+	/// newcomer onto the same GUID without removing it: two owners, and a section that only grew.
+	/// </summary>
+	[Fact]
+	public void TakingAnAbsentDevicesSlotForgetsItsRecord()
+	{
+		var store = new FakeGuidStore();
+		var first = new GuidPool("тома", "vol", Pool(2), store);
+		var a = first.For("A");
+		first.For("B");
+
+		var second = new GuidPool("тома", "vol", Pool(2), store);   // a restart with A and B gone
+		Assert.Equal(a, second.For("C"));
+		Assert.Equal("C", store.OwnerOf("vol", a.Value));
+		Assert.False(store.TryGet("vol", "A", out _));
+		Assert.True(store.TryGet("vol", "B", out _));               // only the one displaced
+	}
+}
+
+public sealed class StepTests
+{
+	/// <summary>
+	/// Free space wavering around its limit in gigabytes went in and out of the red on every poll:
+	/// the step lands exactly on the threshold, so the margin of LevelOf never applied, and every
+	/// entry was a balloon and an Error event.
+	/// </summary>
+	[Fact]
+	public void TheGigabyteConditionHoldsUntilItClearsItsMargin()
+	{
+		double Severity(double free, int prior) => Steps.Gigabytes(free, null, 10, 85, 95, prior);
+		Assert.Equal(95, Severity(9.9, Alarm.Normal));
+		Assert.Equal(0, Severity(10.1, Alarm.Normal));      // never fired: no margin to hold it
+		Assert.Equal(95, Severity(10.1, Alarm.Critical));   // fired: holds up to 11 GB
+		Assert.Equal(95, Severity(10.9, Alarm.Critical));
+		Assert.Equal(0, Severity(11.1, Alarm.Critical));
+	}
+
+	[Fact]
+	public void TheMarginIsThreePerCentButNeverUnderAGigabyte()
+	{
+		Assert.Equal(1, Steps.Margin(10));
+		Assert.Equal(30, Steps.Margin(1000), 6);
+		Assert.Equal(85, Steps.Gigabytes(102.5, 100, null, 85, 95, Alarm.Warning));
+		Assert.Equal(0, Steps.Gigabytes(102.5, 100, null, 85, 95, Alarm.Normal));
+		Assert.Equal(0, Steps.Gigabytes(103.5, 100, null, 85, 95, Alarm.Warning));
+	}
+
+	[Fact]
+	public void ShortRuntimeHoldsUntilFiveAndAHalfMinutes()
+	{
+		Assert.True(Steps.ShortRuntime(4, Alarm.Normal));
+		Assert.False(Steps.ShortRuntime(5, Alarm.Normal));
+		Assert.True(Steps.ShortRuntime(5, Alarm.Critical));
+		Assert.False(Steps.ShortRuntime(5.5, Alarm.Critical));
+		Assert.False(Steps.ShortRuntime(null, Alarm.Critical));
+	}
 }
 
 public sealed class StatsTests
@@ -251,13 +310,14 @@ public sealed class AlarmTests
 public sealed class StorageTemperatureTests
 {
 	/// <summary>A descriptor as the storage driver fills it: header 24, one 16-byte entry.</summary>
-	private static byte[] Answer(short celsius, ushort count = 1, uint? size = null)
+	private static byte[] Answer(short celsius, ushort count = 1, uint? size = null,
+								 short critical = 80, short warning = 70)
 	{
 		var buffer = new byte[StorageTemperature.HeaderSize + StorageTemperature.EntrySize];
 		BitConverter.GetBytes(1u).CopyTo(buffer, 0);                                  // Version
 		BitConverter.GetBytes(size ?? (uint)buffer.Length).CopyTo(buffer, 4);          // Size
-		BitConverter.GetBytes((short)80).CopyTo(buffer, 8);                            // Critical
-		BitConverter.GetBytes((short)70).CopyTo(buffer, 10);                           // Warning
+		BitConverter.GetBytes(critical).CopyTo(buffer, 8);                             // Critical
+		BitConverter.GetBytes(warning).CopyTo(buffer, 10);                             // Warning
 		BitConverter.GetBytes(count).CopyTo(buffer, 12);                               // InfoCount
 		BitConverter.GetBytes((ushort)0).CopyTo(buffer, StorageTemperature.HeaderSize); // Index
 		BitConverter.GetBytes(celsius).CopyTo(buffer, StorageTemperature.HeaderSize + 2);
@@ -290,6 +350,27 @@ public sealed class StorageTemperatureTests
 		Assert.Null(StorageTemperature.Parse(Answer(47, size: 8), buffer.Length));   // Size too small
 		Assert.Null(StorageTemperature.Parse(Answer(47, size: 4096), buffer.Length)); // Size too big
 		Assert.Null(StorageTemperature.Parse(null, 40));
+	}
+
+	/// <summary>The drive's own limits come in the same answer, at offsets 8 and 10.</summary>
+	[Fact]
+	public void ReadsTheDrivesOwnLimits()
+	{
+		var buffer = Answer(47, critical: 85, warning: 82);
+		Assert.Equal((82.0, 85.0), StorageTemperature.Limits(buffer, buffer.Length));
+	}
+
+	/// <summary>Zero is "not reported"; a Kelvin value, an inverted pair or noise is not a limit.</summary>
+	[Theory]
+	[InlineData(0, 0)]
+	[InlineData(85, 0)]
+	[InlineData(358, 343)]
+	[InlineData(70, 80)]
+	[InlineData(80, 80)]
+	public void NonsenseLimitsAreIgnored(short critical, short warning)
+	{
+		var buffer = Answer(47, critical: critical, warning: warning);
+		Assert.Null(StorageTemperature.Limits(buffer, buffer.Length));
 	}
 
 	[Fact]

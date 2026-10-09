@@ -88,10 +88,16 @@ internal sealed class GuidPool
 		}
 
 		// Nothing free that is not spoken for. A remembered assignment must not outrank a source
-		// that is here now, so the second pass ignores the remembered table.
+		// that is here now, so the second pass ignores the remembered table — and takes the absent
+		// owner's record out of it. Left in, the GUID had two owners in the file, and the section
+		// grew by one entry for every device that came and went between runs: Release() only ever
+		// forgets what this process itself handed out.
 		foreach (var candidate in _pool)
 		{
 			if (_taken.ContainsValue(candidate)) continue;
+			var displaced = _store?.OwnerOf(Id, candidate);
+			if (displaced is not null && !string.Equals(displaced, key, StringComparison.Ordinal))
+				_store.Remove(Id, displaced);
 			_taken[key] = candidate;
 			_refused.Remove(key);
 			_store?.Set(Id, key, candidate);
@@ -240,6 +246,40 @@ internal static class Scale
 		if (v < crit) return Yellow + (Red - Yellow) * (v - warn) / (crit - warn);
 		return Math.Min(Red + (Red - Yellow) * (v - crit) / (crit - warn), Ceiling);
 	}
+}
+
+/// <summary>
+/// Conditions that lift a severity straight to a threshold — a step, not a slope. The margin in
+/// <see cref="Alarm.LevelOf"/> is three per cent of the scale, and a step lands exactly on the
+/// threshold, so it never cleared that margin: free space wavering around its limit in gigabytes,
+/// or a UPS reporting 4 and 5 minutes left in turn, went in and out of the red on every poll, and
+/// every entry was a balloon and an Error event. These carry a margin of their own instead.
+/// </summary>
+internal static class Steps
+{
+	/// <summary>
+	/// The gigabytes-left condition on the "percent used" scale of the plate: the red threshold,
+	/// the yellow one, or zero. Once it holds, it holds until the space left clears the limit by
+	/// <see cref="Margin"/>.
+	/// </summary>
+	/// <param name="prior">Alert level the slot is at now.</param>
+	public static double Gigabytes(double freeGb, double? warnGb, double? critGb, double warn, double crit, int prior)
+	{
+		if (critGb.HasValue && freeGb <= critGb.Value + (prior >= Alarm.Critical ? Margin(critGb.Value) : 0))
+			return crit;
+		if (warnGb.HasValue && freeGb <= warnGb.Value + (prior >= Alarm.Warning ? Margin(warnGb.Value) : 0))
+			return warn;
+		return 0;
+	}
+
+	/// <summary>Three per cent of the limit, as everywhere else, but never under a gigabyte: on a
+	/// limit of 10 GB three per cent is less than an ordinary download.</summary>
+	public static double Margin(double gb) => Math.Max(1, 0.03 * gb);
+
+	/// <summary>Under five minutes of runtime on the UPS — red whatever the charge says — and, once
+	/// red, until five and a half.</summary>
+	public static bool ShortRuntime(double? minutes, int prior) =>
+		minutes is double m && (m < 5 || (prior >= Alarm.Critical && m < 5.5));
 }
 
 /// <summary>
@@ -398,19 +438,41 @@ internal static class StorageTemperature
 	/// or null when the answer carries none.</summary>
 	public static double? Parse(byte[] buffer, int returned)
 	{
-		if (buffer is null || returned < HeaderSize + EntrySize || returned > buffer.Length) return null;
-
-		var size = BitConverter.ToUInt32(buffer, 4);
-		// Size is the whole descriptor as the driver filled it. A value that does not even cover
-		// one entry, or that claims more than came back, means this is not the structure we think.
-		if (size < HeaderSize + EntrySize || size > returned) return null;
-
-		var count = BitConverter.ToUInt16(buffer, 12);
-		if (count == 0) return null;
-
+		if (!Valid(buffer, returned)) return null;
 		var celsius = BitConverter.ToInt16(buffer, HeaderSize + 2);
 		// The driver reports SHRT_MIN for "not measured", and no disk is colder than -40 or
 		// hotter than 200 while it is still answering ioctls.
 		return celsius is > -40 and < 200 ? celsius : null;
+	}
+
+	/// <summary>
+	/// The drive's own warning and critical temperatures — WCTEMP and CCTEMP on NVMe, converted to
+	/// Celsius by the driver — or null unless both are there and make sense together.
+	/// </summary>
+	/// <remarks>
+	/// The built-in 60/70 °C is one pair for every drive, and an NVMe drive under load runs at 60-70
+	/// as a matter of course: with notifications on by default for disks, that was a red plate, a
+	/// balloon and an Error event for a drive doing its job. Zero means "not reported"; anything
+	/// outside 40-125 °C is a Kelvin value or a firmware that fills the field with noise.
+	/// </remarks>
+	public static (double Warn, double Crit)? Limits(byte[] buffer, int returned)
+	{
+		if (!Valid(buffer, returned)) return null;
+		var critical = BitConverter.ToInt16(buffer, 8);
+		var warning = BitConverter.ToInt16(buffer, 10);
+		if (warning is < 40 or > 125 || critical is < 40 or > 125 || warning >= critical) return null;
+		return (warning, critical);
+	}
+
+	private static bool Valid(byte[] buffer, int returned)
+	{
+		if (buffer is null || returned < HeaderSize + EntrySize || returned > buffer.Length) return false;
+
+		var size = BitConverter.ToUInt32(buffer, 4);
+		// Size is the whole descriptor as the driver filled it. A value that does not even cover
+		// one entry, or that claims more than came back, means this is not the structure we think.
+		if (size < HeaderSize + EntrySize || size > returned) return false;
+
+		return BitConverter.ToUInt16(buffer, 12) > 0;   // InfoCount
 	}
 }

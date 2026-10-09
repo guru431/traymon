@@ -44,6 +44,10 @@ public sealed class HddSensor
 	private long _discoveredAt;
 	private bool? _safe;
 
+	/// <summary>Each device's last answer while it was awake, so a disk found asleep can still be
+	/// named. Only ever touched by the one reader thread the refresh flag allows.</summary>
+	private readonly Dictionary<string, RaidDisk> _lastAwake = new(StringComparer.OrdinalIgnoreCase);
+
 	/// <summary>Why the last run failed, if it did; shown by the diagnostics window.</summary>
 	public string LastError { get; private set; }
 
@@ -91,6 +95,7 @@ public sealed class HddSensor
 			_discoveredAt = Environment.TickCount64;
 		}
 		var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		var asleep = 0;
 
 		foreach (var (device, type) in _devices)
 		{
@@ -103,26 +108,67 @@ public sealed class HddSensor
 			if (json is null) continue;
 
 			var root = json.RootElement;
+			// smartctl checks the power mode before anything else and stops there: no identity, no
+			// health, no temperature — so a sleeping disk was dropped below as "no answer", its icon
+			// went grey as "не отвечает", and a disk marked as required reported its data lost
+			// every time it parked. It is the same disk, last seen healthy or not.
+			if (Sleeping(root))
+			{
+				asleep++;
+				if (!_lastAwake.TryGetValue(device, out var last) || !seen.Add(Key(last.Serial, device))) continue;
+				disks.Add(last with { Temp = null, Asleep = true });
+				continue;
+			}
+
 			var temp = Nested(root, "temperature", "current");
 			var health = Health(root);
 			// Health without a temperature is still an answer, and the most important one there
-			// is: a disk in standby, or one whose firmware reports no temperature, used to be
-			// dropped here — before the SMART verdict was even looked at — so a failing disk
-			// produced no icon, no red plate and no event.
+			// is: a disk whose firmware reports no temperature used to be dropped here — before the
+			// SMART verdict was even looked at — so a failing disk produced no icon, no red plate
+			// and no event.
 			if (temp is null && health.Length == 0) continue;
 
 			var serial = Text(root, "serial_number") ?? "";
-			var key = serial.Length > 0 ? serial : device;
-			if (!seen.Add(key)) continue;   // same disk answering on another port
+			if (!seen.Add(Key(serial, device))) continue;   // same disk answering on another port
 
 			var name = Text(root, "model_name") ?? Text(root, "device_model") ?? "RAID disk";
-			disks.Add(new RaidDisk(name.Trim(), temp, serial, health));
+			var disk = new RaidDisk(name.Trim(), temp, serial, health);
+			_lastAwake[device] = disk;
+			disks.Add(disk);
 		}
 
-		// Nothing answered: the controller or the disks changed, so look again next time.
-		if (disks.Count == 0) _devices = null;
+		// Nothing answered: the controller or the disks changed, so look again next time. A disk
+		// that answered "asleep" did answer — rescanning for it would only cost another run.
+		if (disks.Count == 0 && asleep == 0) _devices = null;
 		else LastError = null;
 		return disks;
+	}
+
+	private static string Key(string serial, string device) => string.IsNullOrEmpty(serial) ? device : serial;
+
+	/// <summary>
+	/// Whether smartctl stopped at the power check. Newer versions say so in <c>power_mode</c>,
+	/// all of them in a message — "Device is in STANDBY mode, exit(0)" — and in neither case is
+	/// there an identity section, which is what tells it apart from a disk merely reporting its
+	/// power state alongside everything else.
+	/// </summary>
+	private static bool Sleeping(JsonElement root)
+	{
+		if (root.TryGetProperty("model_name", out _) || root.TryGetProperty("device_model", out _) ||
+			root.TryGetProperty("serial_number", out _)) return false;
+		if (root.TryGetProperty("power_mode", out var mode) && Text(mode, "name") is { } name &&
+			(name.StartsWith("STANDBY", StringComparison.OrdinalIgnoreCase) ||
+			 name.StartsWith("SLEEP", StringComparison.OrdinalIgnoreCase))) return true;
+		if (!root.TryGetProperty("smartctl", out var tool) || !tool.TryGetProperty("messages", out var messages) ||
+			messages.ValueKind != JsonValueKind.Array) return false;
+		foreach (var message in messages.EnumerateArray())
+		{
+			var text = Text(message, "string");
+			if (text is null || !text.StartsWith("Device is in ", StringComparison.Ordinal)) continue;
+			if (text.Contains("STANDBY", StringComparison.Ordinal) || text.Contains("SLEEP", StringComparison.Ordinal))
+				return true;
+		}
+		return false;
 	}
 
 	/// <summary>

@@ -5,6 +5,24 @@ using System.Runtime.InteropServices;
 namespace TrayMon;
 
 /// <summary>
+/// CPU cycles spent by the calling thread so far. The diagnostics window attributes the cost of
+/// the running program to its sources with this: a stopwatch counts waiting on a socket, an
+/// external process and a lock as if it were work, and the process total says nothing about which
+/// part of the program it went to. One call is a fraction of a microsecond.
+/// </summary>
+internal static class CycleClock
+{
+	[DllImport("kernel32.dll")]
+	private static extern IntPtr GetCurrentThread();
+
+	[DllImport("kernel32.dll")]
+	[return: MarshalAs(UnmanagedType.Bool)]
+	private static extern bool QueryThreadCycleTime(IntPtr thread, out ulong cycles);
+
+	public static ulong Now() => QueryThreadCycleTime(GetCurrentThread(), out var cycles) ? cycles : 0;
+}
+
+/// <summary>
 /// One tray slot: a small icon with a number on a coloured plate, plus its own tooltip.
 /// The plate colour identifies the metric; it turns yellow and then red once the value
 /// crosses the warning and critical thresholds, and grows a corner notch at the same time so
@@ -102,14 +120,20 @@ public sealed class TrayValueIcon : IDisposable
 
 	public static long ShellCalls;
 
+	/// <summary>CPU cycles of this process spent drawing icons and calling the shell — the
+	/// shell's own repaint happens in explorer.exe and is not in here. See <see cref="CycleClock"/>.</summary>
+	public static long Cycles;
+
 	private static bool Shell_NotifyIcon(int message, ref NotifyIconData data) =>
 		Shell_NotifyIcon(message, ref data, out _);
 
 	private static bool Shell_NotifyIcon(int message, ref NotifyIconData data, out int lastError)
 	{
 		Interlocked.Increment(ref ShellCalls);
+		var started = CycleClock.Now();
 		var ok = ShellNotifyIcon(message, ref data);
 		lastError = ok ? 0 : Marshal.GetLastWin32Error();
+		Interlocked.Add(ref Cycles, (long)(CycleClock.Now() - started));
 		return ok;
 	}
 
@@ -476,7 +500,13 @@ public sealed class TrayValueIcon : IDisposable
 	private IntPtr Render(string text, Color plate, int level)
 	{
 		Interlocked.Increment(ref Renders);
+		var started = CycleClock.Now();
+		try { return Draw(text, plate, level); }
+		finally { Interlocked.Add(ref Cycles, (long)(CycleClock.Now() - started)); }
+	}
 
+	private IntPtr Draw(string text, Color plate, int level)
+	{
 		// Draw at the size Windows actually asks for, so nothing is rescaled on high-DPI screens.
 		var side = Math.Max(16, SystemInformation.SmallIconSize.Height);
 		if (_canvas is null || side != _side)

@@ -44,7 +44,7 @@ deliberately share the colour of directly attached disks:
 | VRAM ×N | video memory used, GB | green | 75 / 90 % of capacity |
 | °C ×N | GPU temperature | blue | 80 / 90 °C |
 | rpm ×N | graphics card fan (slowest of its fans) | dark magenta | standstill (0) |
-| °C ×N | temperature of each disk | orange | 60 / 70 °C, or NVMe wear exhausted |
+| °C ×N | temperature of each disk | orange | 60 / 70 °C, or the drive's own limits when it reports them; or NVMe wear exhausted |
 | °C ×N | temperature of each disk behind RAID | orange | 55 / 65 °C, or a bad SMART verdict |
 | rpm ×N | speed of each motherboard fan | magenta | standstill (0) |
 | NET ×N | throughput per adapter, Mbit/s (in + out; Gbit/s past 10000, unit in the caption) | azure | 70 / 90 % of the link |
@@ -60,15 +60,16 @@ red**, whatever those thresholds are set to. The number is in those arbitrary un
 percentage of anything; the colour is taken straight from the worst state among the other icons,
 so the summary plate is always exactly the worst plate in the tray. Above 100 the number says by
 how much the red line has been passed. With nothing measurable to rank, the icon goes grey — "no
-alarms" over no data would not be true — and a source marked as expected that has fallen silent
-is counted in its tooltip.
+alarms" over no data would not be true — and a source marked as expected that has fallen silent,
+or has not answered once since the start, is counted in its tooltip. The worst metric, "ПОРОГ
+ПРЕВЫШЕН" and that count come first, the scale legend last: a tooltip is cut at 127 characters.
 
 Each icon has its own tooltip with the detail: gigabytes, percent and commit charge for RAM,
 read and write separately plus the three heaviest I/O processes for a volume, exact rpm and duty
 for a fan, in and out separately for the network in both megabits and megabytes plus the
 percentage of the link. The minimum, mean and maximum of the last five minutes are shown where
-they mean something (loads, temperatures, fan speeds, network, free space); uptime, the UPS and
-the summary icon have no such line.
+they mean something (loads, temperatures, fan speeds, network, free space); volume throughput (its
+tooltip needs the room for three processes), uptime, the UPS and the summary icon have no such line.
 
 The network gets one icon per physical adapter, captioned with its description. PDH writes that
 description with square brackets — `Intel[R] Wi-Fi 6E AX211 160MHz` — and the id in
@@ -84,11 +85,17 @@ failure for a monitor: "network 0 Mbit/s" and "the cable is unplugged" would loo
 only one of them is true.
 
 **That covers a stuck poll, not only a device that went away.** Every background measurement is
-published with the moment it was taken, and a snapshot older than two periods does not count as
-alive: the icon goes grey saying "опрос не завершился — данные устарели на N с". Without that a
-hung reader looked exactly like a working one — the flag that stops a slow answer from overlapping
-the next one also stops new attempts being made. The diagnostics window lists the age of every
-source and when it is due again.
+published with the moment it was taken, and a snapshot older than two periods — or two ticks, when
+a tick is longer — does not count as alive: the icon goes grey saying "опрос не завершился —
+данные устарели на N с". Without that a hung reader looked exactly like a working one — the flag
+that stops a slow answer from overlapping the next one also stops new attempts being made. The
+diagnostics window lists the age of every source and when it is due again.
+
+**Sleep is not a source going away.** The clock data age is measured by runs on through sleep, so
+the first tick after a wake-up saw every background snapshot as hours old: disks, RAID, fans and
+the UPS went grey, required ones reported their data lost and back, and after a night longer than
+a day their slots gave their GUIDs back. Their icons now wait for the first answer after the wake-up
+(no longer than the usual freshness limit), and the day before a GUID is released excludes sleep.
 
 The numbers are coarse on purpose — fan speeds in thousands (`0.6` means 586 rpm), volume
 throughput, free space and network in whole units. Every changed digit costs a repaint and a
@@ -111,14 +118,19 @@ most expensive thing this program does. **The level is decided in one place** an
 plate, the balloon, the event-log entry and the summary icon alike: there used to be three, so
 85 → 82.9 against 70/85 left the icon red while the summary turned yellow, and a value
 oscillating around a threshold wrote "entered the red" into the journal again and again for an
-icon that never left it.
+icon that never left it. Step conditions — gigabytes left on a volume, "under five minutes" on the
+UPS — lift the plate straight to the threshold, where that margin never applies, so they carry
+their own: once fired, the gigabyte condition clears at max(1 GB, 3 %) above its limit and the UPS
+one at five and a half minutes. Without it 9.9 ↔ 10.1 GB against a limit of 10 notified on every poll.
 
 **Fans, the UPS, the battery and free space have inverted severity:** a stopped fan is alarming,
 not a fast one; a low charge, not a high one; little free space, not a lot. Going onto battery
 turns the plate red at any charge. The plate also turns yellow on bypass, while AVR is
 trimming or boosting the mains, and when the UPS asks for a new battery; it turns red when
 less than five minutes of runtime are left, whatever the charge gauge claims — and when the agent
-carries no charge OID at all, the icon shows "—" and still raises the alarm. The threshold dialog
+carries no charge OID at all, the icon shows "—" and still raises the alarm. A **UPS self-test**
+(`onBatteryTest`) is not running on battery: the mains is there and the battery carries the load
+by design, so no red plate, no Error event and no "mains restored" follow it. The threshold dialog
 for such metrics asks for and shows **charge**, not the internal severity. A laptop battery's
 charge thresholds only apply while it is discharging: on the mains there is no highlight. On the
 *known* mains, that is — when Windows answers "power state unknown", the charge thresholds do
@@ -134,13 +146,25 @@ a GPU fan whose driver reports no rpm raises no standstill alarm at all, and say
 log** (source TrayMon) — by default for disks, RAID disks, fans, free space and the UPS. A balloon
 needs somebody in front of the screen; a server's existing monitoring reads the event log without
 one. It can be switched on or off per icon, and **the UPS going onto battery now obeys that same
-checkbox** — it used to take a path of its own and ignore it. A state already present at startup
-is reported too: a RAID disk already failing, a volume already full, a UPS already on battery.
-The last 50 colour changes are listed in the diagnostics window.
+checkbox** — it used to take a path of its own and ignore it. On the UPS the same checkbox also
+raises **warnings** (Warning in the log) when it enters or leaves a bypass and when it starts or
+stops asking for a new battery: yellow states, but the ones that decide whether the next outage is
+survived, on an icon hidden by default. AVR is not reported — on a poor mains it switches dozens of
+times a day. A state already present at startup is reported too: a RAID disk already failing, a
+volume already full, a UPS already on battery. The last 50 colour changes are listed in the
+diagnostics window.
 
 **A source can be marked as expected** ("Источник обязателен"): losing and regaining its data is
-then an event of its own, and the summary icon counts such gaps. Everything is optional by
-default — a fresh machine must not raise an alarm for every technology it does not have.
+then an event of its own — a balloon and a log entry **whatever the notification checkbox says**,
+since that one is about the red, is off by default on most metrics and does not exist on volumes
+and uptime — and the summary icon counts such gaps. An expected source absent from the start (an
+agent that never answered, a volume not plugged in) gets a grey icon with its reason instead of
+being nowhere. Everything is optional by default — a fresh machine must not raise an alarm for
+every technology it does not have.
+
+**Nobody sees balloons while the session is locked or disconnected.** On coming back, if anything
+went into the red or an expected source went quiet meanwhile, the program says once how many, and
+how many are red now; the events themselves are already in the Windows log.
 
 **Alarms are not encoded in colour alone.** A yellow plate grows a triangular notch in its
 top-right corner, a red one gets two, top and bottom. Colour cannot be told apart under
@@ -158,17 +182,21 @@ lives in "Программа ▸": start with Windows, desktop shortcut, open an
 diagnostics, about, uninstall. Then "Выход".
 
 Thresholds are not offered where there is nothing to set: fans alarm only on standing still,
-volumes and uptime never alarm at all. Switching the highlight off keeps whatever thresholds
-were configured. "Poll now" also rediscovers the disks behind the controller and restores SNMP
-OIDs the agent once refused.
+volumes and uptime never alarm at all, and the summary icon's colour is the worst plate's. Switching
+the highlight off keeps whatever thresholds were configured. "Poll now" also rediscovers the disks
+behind the controller and restores SNMP OIDs the agent once refused. The diagnostics window also
+shows what the program's own cycles went to, by source and drawing, as shares — a hint where to
+look; the paired measurement in `docs/measuring.md` is what decides.
 
 **Threshold highlighting overrides the chosen plate colour.** While a value is above the warning
 threshold the icon is yellow or red whatever colour was picked; the program says so when a
 colour is chosen for an icon that is currently highlighted.
 
-**The first run shows two to four icons** — CPU and RAM, plus GPU and VRAM on a machine with an
-NVIDIA card. The rest are switched on from the menu: seventeen icons at once would go straight
-into the Windows 11 overflow, and the menu lives on the icons.
+**The first run shows three to five icons** — CPU, RAM and the summary icon, plus GPU and VRAM of
+the first card on a machine with an NVIDIA card. The rest are switched on from the menu: seventeen
+icons at once would go straight into the Windows 11 overflow, and the menu lives on the icons. **The
+summary icon stands for all the hidden ones:** it turns yellow and red with them, so a UPS asking
+for a new battery or a disk at 60 °C shows in the tray while their own icons are off.
 
 **While the session is locked or the RDP session is disconnected, drawing slows from 2 s to
 30 s.** Nobody can see the icons. The **measurement** schedules do not change with it — they are
@@ -217,11 +245,21 @@ carried over automatically on the first run of this version.
 
 Per-icon fields: `Enabled`, `Color`, `Label`, `Ink`, `Warn`, `Crit`, `Alerts`, `NotifyOnCritical`,
 `Required`, `Stall` (`zero-ok` or `off`), `WarnGb` / `CritGb` (free space only). `Alerts: false`
-switches threshold colouring off without touching the thresholds. Unusable values (`NaN`,
-`Infinity`, a red threshold on the wrong side of the yellow one) are dropped on load and reported
-in the diagnostics window; such a pair used to load in silence and paint a red plate the summary
-icon refused to rank. That is a **note, not a refusal to read the file** — everything else in it
-still applies, and the "could not be read" dialog is reserved for a file that really did not parse.
+switches threshold colouring off without touching the thresholds. Unusable values are dropped
+and reported in the diagnostics window: a number outside 0…10⁶ (an overflowing `1e400` included),
+a red threshold on the wrong side of the yellow one — and a lone `Warn` or `Crit` that makes such
+a pair together with the built-in threshold (`"Crit": 50` on a RAID disk, whose built-in yellow is
+55, switched the alarm off altogether, a failing disk included). Such values used to load in
+silence. That is a **note, not a refusal to read the file** — everything else in it still applies,
+and the "could not be read" dialog is reserved for a file that really did not parse. `NaN` and
+`Infinity`, as a literal or a string, are that: the JSON reader refuses them outright.
+
+A disk that reports its own temperature limits (NVMe WCTEMP/CCTEMP) is judged by them instead of
+the built-in 60/70 °C — an NVMe drive under load runs at 60–70 as a matter of course. The tooltip
+shows them, "Пороги…" offers them as current, and your own `Warn`/`Crit` still win.
+
+The file is written in UTF-8 with Cyrillic as itself: a caption typed into "Переименовать…" used to
+land in it as `Пр…`.
 
 **Files from older versions are migrated, not rejected.** Before `Alerts` existed, a switched-off
 highlight was written as `"Warn": 1000000000, "Crit": 1000000000`, and such files are still around.
@@ -231,13 +269,16 @@ somebody had deliberately silenced.
 
 - `TickMs` — the **drawing** interval, upwards only: anything below 2000 is refused. Measurement
   periods are separate and in seconds, so raising it makes the program cheaper without pushing
-  detection of a real problem beyond one tick.
+  detection of a real problem beyond one tick. The freshness limit of background data counts from
+  the longer of the period and the tick — above 42 s the CPU temperature and the fans used to be
+  never fresh at all.
 - `Net.NotPhysical` — **a custom list replaces the built-in one entirely**, which is why it is
   spelled out in full above. `Net.Include` is the way to keep a VPN or a virtual adapter you do
   watch without rewriting that list; `Net.Bandwidth` gives the percentage a figure to divide by
   where the driver leaves `Current Bandwidth` empty or where a Wi-Fi link rate is not a capacity.
   With no link speed the utilisation is not invented: there is no threshold colour and the tooltip
-  says the link speed is unknown.
+  says the link speed is unknown. A configured bandwidth does not stand in for the link itself: a
+  Wi-Fi out of range or an unplugged cable still greys the icon out with "no link".
 - `Tools.Smartctl` — a relative path is resolved against the program folder, never against the
   working directory. It is refused only in the case where refusing buys something: **the program
   folder is protected and the configured tool is somewhere weaker** — a settings file leading an
@@ -249,9 +290,14 @@ somebody had deliberately silenced.
   loads, unopened. CPU temperature, motherboard fans and NVMe wear then have no source and say so.
 - `Log` — `time;id;value;unit;severity;status;measured_at`, one row per icon. The raw number in a
   fixed unit, not the text from the plate (which changes unit by itself: GB→TB, hours→days), ids
-  quoted, timestamps with a UTC offset. **Floor** of 30 s, not a ceiling; the file rolls over to
-  `.1` at `MaxMb`; the write happens on a background thread, because on a network share it used to
-  block the whole poll.
+  quoted, timestamps with a UTC offset. `status` is `ok`; `dead` — the source went away, value and
+  severity empty, `measured_at` its last measurement (such rows used to simply stop); or `stale` —
+  the previous value, while a background poll has not answered yet after the machine slept.
+  **Floor** of 30 s, not a ceiling; the file rolls over to `.1` at `MaxMb`; the write happens on a
+  background thread, because on a network share it used to block the whole poll. The rule
+  `smartctl.exe` follows applies here too: **with the program folder protected and the log sent to a
+  folder an ordinary user can write to**, it is not written — an elevated process appends to and
+  renames that file, and a junction put in its folder would send both anywhere.
 - `Slots` — which tray identity each source holds. Written by the program: without it, a restart
   with one device absent handed its GUID, its tray position and its visibility to the next device.
 - `Ups.Community` — `public` is rarely the right answer; set your own.
@@ -260,8 +306,12 @@ somebody had deliberately silenced.
 changing (a few seconds at the built-in interval, longer at a raised one); "Перечитать настройки"
 does it at once. The UPS address, the smartctl path, the adapter filter, `TickMs` and the sensor
 profile only take effect on restart. A change from the menu rewrites the file whole — but re-reads
-it first when it was edited from outside, so an external edit is not overwritten. Auto-reload never
-moves an unreadable file aside: `.bad` is only made at startup, and an existing `.bad` is kept.
+it first when it was edited from outside, and carries only the one setting being changed onto the
+fresh copy, not the icon's whole entry. Auto-reload never moves an unreadable file aside: `.bad` is
+only made at startup, and an existing `.bad` is kept. **A file that failed to load at startup and
+stayed in place** (a `.bad` already existed) is never overwritten with the defaults, by the scheduled
+save or by the menu: it has to read first — and then its settings and its whole `Slots` history come
+back, with whatever was handed out on the defaults meanwhile only added to it.
 
 You cannot hide every icon, from the menu or through the file: the menu lives on them, and
 without the last one there would be no way even to quit.
@@ -275,18 +325,29 @@ without the last one there would be no way even to quit.
 | Laptop battery | `GetSystemPowerStatus` | 2 s | &lt; 0.1 ms |
 | Uptime | `GetTickCount64` | 2 s | 0 ms |
 | GPU load, memory, temperature, fan | `nvml.dll` (P/Invoke), every card | 4 s | 4 ms per card |
-| CPU temperature, fans | LibreHardwareMonitorLib, on a background thread | 6 s | 20–45 ms |
-| Network per adapter, volume throughput | PDH wildcards | 6 s | 6 ms |
-| Heaviest I/O processes | PDH: `\Process(*)\IO Data Bytes/sec`, background | 12 s | 12 ms |
+| CPU temperature, fans | LibreHardwareMonitorLib, on a pool thread at normal priority | 6 s | 20–45 ms |
+| Network per adapter, volume throughput | PDH wildcards in a query of their own — an average over the 6 s | 6 s | 6 ms |
+| Heaviest I/O processes | PDH: `\Process(*)\IO Data Bytes/sec`, background, only with a volume icon shown | 12 s | 12 ms |
 | Disk temperatures | `IOCTL_STORAGE_QUERY_PROPERTY`, background | 62 s | &lt; 1 ms per disk |
-| NVMe wear and spare | LibreHardwareMonitorLib, SMART, background | 62 s | 6 ms |
+| NVMe wear and spare | LibreHardwareMonitorLib, SMART, background — NVMe and disks the driver did not answer for only | 62 s | 6 ms |
 | Free space | `GetDiskFreeSpaceEx`, background | 300 s | 2 ms |
 | Temperature and health of disks behind RAID | `smartctl.exe`, background | 600 s | ~90 ms per disk |
 | UPS charge, runtime, load | SNMP, PowerNet MIB, hand-rolled over UDP, background | 30 s | 17 ms |
 
 Anything costing more than a few milliseconds is read in a `Task.Run` behind a flag that stops
 a slow answer from overlapping the next one, and those pool threads run in background mode, so
-they compete with the real work of the machine for neither CPU nor I/O.
+they compete with the real work of the machine for neither CPU nor I/O — except the CPU
+temperature and fan read. The sensor library moves its thread from core to core, and a
+background-mode thread waited on every busy core for the scheduler's anti-starvation boost: under
+full load, exactly when the temperature matters, one read could outlast its freshness limit. The
+work, and so its CPU time, is the same either way.
+
+**Network and volumes are collected in their own PDH query, and only when read** — every 6 s. A
+rate counter is the difference of the last two collects; sharing the CPU query, they were collected
+every tick and read every third, so the icon, the five-minute line, the CSV and the bandwidth
+thresholds saw the last two seconds of every six. The value is now the average over all six, which
+smooths a short burst. Measured per collect: CPU alone 0.04 M cycles, network and volumes 2.6 M,
+all six together 2.8 M — six seconds of collects now cost 2.7 M cycles instead of 8.4 M.
 
 **The periods above are wall-clock, not multiples of the tick.** While they were multiples, a
 `TickMs` of 30000 — or a locked session — turned the UPS's "30 s" into 450 and the RAID "600 s"
@@ -296,13 +357,15 @@ first tick after its deadline.
 A rule used to be documented here: "if two periods share a divisor, their phases must differ
 modulo it". It was wrong — a collision happens exactly when the phases agree modulo the *gcd* —
 and its own table broke it, since 31 and 3 are coprime. What actually matters is not arithmetic:
-no heavy read happens on the UI thread at all, the sensor library cannot be entered from two
-threads (its own lock), and a slow answer cannot pile up on the next one (the running flags). Two
-background polls overlapping is allowed and costs the UI thread nothing.
+no heavy read happens on the UI thread at all, the CPU and board part of the sensor library cannot
+be entered from two threads (its own lock; the drives have a separate one), and a slow answer
+cannot pile up on the next one (the running flags). Two background polls overlapping is allowed
+and costs the UI thread nothing.
 
 A source that is not there — the SNMP agent defaults to the loopback, `smartctl.exe` may never
 have been copied — is polled every five minutes instead of every thirty seconds after five
-failures in a row. "Опросить датчики сейчас" (poll now) resets that immediately.
+failures in a row. That only acts on the UPS: the RAID disks are polled every ten minutes anyway,
+longer than the back-off. "Опросить датчики сейчас" (poll now) resets it immediately.
 
 Uptime used to be `\System\System Up Time` and cost 5.7 ms per tick against 1.8, because one
 collect gathers **every** object the query mentions and the `System` object carries the process
@@ -328,7 +391,12 @@ desired access, which is all a property query needs. NVMe wear and spare are an 
 still come from the sensor library, matched up by model — but only unambiguously: where two disks
 fit one description, neither is given a wear figure. Disks only the library can see do not vanish
 from the list when the driver answers for others. Without elevation the wear figures are simply
-absent while the temperatures remain.
+absent while the temperatures remain. **The library is asked only about NVMe drives (for the wear)
+and drives the driver did not answer for:** a SMART read of every drive every minute was thrown
+away for SATA, which has neither wear nor spare, and a SMART command is what spins a parked hard
+disk up. The drives are read under a lock of their own, apart from the CPU and the board, so a
+query hanging on a dying disk or a USB bridge no longer greys out the CPU temperature and the fans,
+and exiting waits for it three seconds at most.
 
 **Disks behind a RAID controller** are exposed by no Windows API — an array is one device to
 the system. `smartctl` from [smartmontools](https://www.smartmontools.org/) reaches them over
@@ -336,7 +404,9 @@ CSMI (configurable: LSI and Adaptec need a different `-d`). Its **JSON** output 
 than its human-readable table: Samsung and some Intel SATA SSDs report temperature in attribute
 190 rather than 194, NVMe and SCSI answers have no attribute table at all, and a row saying
 `FAILING_NOW` broke the pattern exactly as the disk started to fail. Sleeping drives are not
-woken (`-n standby,0`). Devices are deduplicated by serial number and the device list is
+woken (`-n standby,0`), and do not lose their icon: smartctl stops at the power check before
+reading even the model, so a sleeping disk is shown alive, with the name and health of its last
+answer and a tooltip saying it is asleep. Devices are deduplicated by serial number and the device list is
 rediscovered hourly and on "poll now" — one healthy old disk used to hold the old list for ever.
 The same query brings back the SMART health verdict: a failing disk matters more than a warm one,
 so a disk **with no temperature but a bad verdict** gets an icon too. It used to be dropped from
@@ -373,7 +443,10 @@ position in a list, which used to move the moment a USB stick added a drive lett
 assignment is remembered in `TrayMon.json`** (`Slots`): the table used to be rebuilt at every
 start in the order sources first answered, so a restart without device A gave A's GUID, its tray
 position and its visibility to device B. A slot is released only after its source has been silent
-for a day — and never if it is the last icon the menu lives on.
+for a day (sleep not counted) — and never if it is the last icon the menu lives on. With no free
+slot left, a newcomer takes the slot of a device that is absent, and the absent one's record goes:
+one GUID never has two owners, and the section does not grow with devices that came and went
+between runs.
 
 If the shell refuses an icon with a GUID — usually because of an entry left over from an
 earlier location of the executable — the program removes the stale entry and retries, and after
@@ -401,7 +474,9 @@ program checks the folder permissions **and those of every folder above it** —
 `D:\Tools\TrayMon` out of the way is no harder than replacing a file inside it — **and the files
 themselves**: the executable, every DLL beside it, `TrayMon.json`, and the `smartctl.exe` that
 file can point at. A file inside a well-protected folder can carry its own permissive ACL, and
-the external tool is started with our token. The task is refused when write access is open to
+the external tool is started with our token. **The same goes for where a path really leads:** a
+junction or a symbolic link in it (`D:\Apps` → `E:\Shared\tools`) used to be checked by the path as
+written, and the real folder by nobody; a path that cannot be resolved counts as unchecked. The task is refused when write access is open to
 anyone but administrators — **and when the permissions could not be read at all**, because a check
 that silently did not run must not look like one that passed. The folder's owner (who can grant
 themselves anything, holding no explicit permission) is reported in the diagnostics window but
@@ -438,7 +513,9 @@ dotnet test tests/TrayMon.Tests/TrayMon.Tests.csproj
 
 The manifest asks for `requireAdministrator`, so `--once` will not start from an ordinary
 console (`ERROR_ELEVATION_REQUIRED`). To see the unelevated behaviour, run the build through
-the runtime instead: `dotnet out\TrayMon.dll --once`.
+the runtime instead: `dotnet out\TrayMon.dll --once`. Unelevated, the `sensor driver` line reads
+`loaded, but reads no temperatures without an elevated token` — the library opens without
+elevation and reads nothing; `UNAVAILABLE` means it did not open at all, and says why.
 
 The code that never touches a driver is covered by tests — the hand-rolled SNMP parser, the GUID
 pool and its persistence, the alert level with its hysteresis, the time-based statistics window,
@@ -485,6 +562,12 @@ an enabled logon trigger, belong to this account and start this file. A task wit
 disabled one or somebody else's does not tick it, and the item's tooltip says which. The task name
 is shared by every installation, so an existing task that starts another file is never overwritten
 without asking.
+
+**Watching only starts at logon** — the task fires on it, so after an unattended reboot nothing runs
+until somebody logs in. That is why TrayMon writes Information events "запущен" (started, with the
+version and the number of icons on) and "остановлен" (stopped, the end of a session included) to the
+Application log: external monitoring can alarm on "no start event after the boot", which silence
+alone cannot tell apart from "all is well". The start event also tries the channel at once.
 
 Tray positions live in `HKCU\Control Panel\NotifyIconSettings`, which is a **Windows 11**
 mechanism; Windows 10 and Server 2019–2022 keep the same state in an undocumented binary blob

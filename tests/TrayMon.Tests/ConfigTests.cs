@@ -50,6 +50,10 @@ public sealed class ConfigTests : IDisposable
 		config.Net.NotPhysical = new List<string> { "vEthernet" };
 		Assert.True(config.Save(out var error), error);
 
+		// Written as itself, not as Пр…: the caption is the one setting the user chose,
+		// in a file they are invited to read.
+		Assert.Contains("\"Процессор\"", File.ReadAllText(Config.Path));
+
 		var read = Config.Load();
 		Assert.Null(read.LoadError);
 		Assert.Equal("#1C5CA8", read.Get("cpu").Color);
@@ -239,18 +243,124 @@ public sealed class ConfigTests : IDisposable
 		Assert.Null(config.Get("cpu").Warn);
 	}
 
-	/// <summary>NaN and Infinity parse out of JSON and then compare false against everything.</summary>
-	[Fact]
-	public void NonFiniteThresholdsAreDropped()
+	/// <summary>
+	/// NaN and Infinity, as a literal or as a string, never reach the validation: the strict JSON
+	/// reader refuses the whole file. This used to be checked only by the threshold coming out
+	/// empty — which is just as true of a file that was not read at all — and the README promised
+	/// a note for both.
+	/// </summary>
+	[Theory]
+	[InlineData("""{ "Icons": { "cpu": { "Warn": NaN } } }""")]
+	[InlineData("""{ "Icons": { "cpu": { "Crit": "Infinity" } } }""")]
+	public void NaNAndInfinityMakeTheFileUnreadable(string json)
 	{
-		File.WriteAllText(Config.Path, """{ "Icons": { "cpu": { "Warn": 1e400, "Crit": 1e401 } } }""");
+		File.WriteAllText(Config.Path, json);
 		var config = Config.Load();
+		Assert.NotNull(config.LoadError);
+		Assert.True(File.Exists(Config.Path + ".bad"));
+	}
+
+	/// <summary>
+	/// What the validation does catch, with a note and the rest of the file applied: a finite number
+	/// out of range, and an overflowing one, which the reader turns into an infinity.
+	/// </summary>
+	[Theory]
+	[InlineData("2e6")]
+	[InlineData("1e400")]
+	public void AnOutOfRangeThresholdIsDroppedWithANote(string warn)
+	{
+		File.WriteAllText(Config.Path, $$"""{ "Icons": { "cpu": { "Color": "#112233", "Warn": {{warn}} } } }""");
+		var config = Config.Load();
+		Assert.Null(config.LoadError);
+		Assert.NotNull(config.LoadNote);
 		Assert.Null(config.Get("cpu").Warn);
-		Assert.Null(config.Get("cpu").Crit);
+		Assert.Equal("#112233", config.Get("cpu").Color);
+	}
+
+	/// <summary>The dialog parses with double.TryParse, which does accept NaN and Infinity.</summary>
+	[Fact]
+	public void SaneRefusesWhatTheDialogCanParse()
+	{
 		Assert.False(Config.Sane(double.NaN));
 		Assert.False(Config.Sane(double.PositiveInfinity));
 		Assert.True(Config.Sane(null));
 		Assert.True(Config.Sane(70));
+	}
+
+	/// <summary>
+	/// The P1 this exists for: a file that failed to load and stayed where it was carries its own
+	/// write time, so it did not count as changed — and the scheduled save wrote the defaults over
+	/// the only copy of the settings.
+	/// </summary>
+	[Fact]
+	public void ABrokenFileLeftInPlaceMustBeReadBeforeAnythingIsWrittenOverIt()
+	{
+		File.WriteAllText(Config.Path + ".bad", "an earlier backup");
+		File.WriteAllText(Config.Path, "{ broken, and the backup slot is taken");
+		var config = Config.Load();
+		Assert.NotNull(config.LoadError);
+		Assert.True(File.Exists(Config.Path));      // left in place: .bad was already there
+		Assert.False(config.ChangedOnDisk);         // which is why this alone was not enough
+		Assert.True(config.MustReadBeforeWrite);
+	}
+
+	/// <summary>Moved aside to .bad, there is nothing left to write over.</summary>
+	[Fact]
+	public void ABrokenFileMovedAsideNeedsNoReadBeforeWriting()
+	{
+		File.WriteAllText(Config.Path, "{ broken");
+		var config = Config.Load();
+		Assert.NotNull(config.LoadError);
+		Assert.False(File.Exists(Config.Path));
+		Assert.False(config.MustReadBeforeWrite);
+	}
+
+	/// <summary>
+	/// A lone threshold judged against the built-in one it is paired with. <c>"Crit": 50</c> on a
+	/// RAID disk, whose built-in yellow is 55, passed the file validation and switched the alarm off
+	/// for good — a disk failing its SMART verdict included.
+	/// </summary>
+	[Fact]
+	public void ALoneThresholdUpsideDownAgainstTheBuiltInOneIsDroppedWithANote()
+	{
+		var config = new Config();
+		config.For("disk.raid.WD-1").Crit = 50;
+		Assert.False(config.KeepInOrder("disk.raid.WD-1", 55, 65));
+		Assert.Null(config.Get("disk.raid.WD-1").Crit);
+		Assert.NotNull(config.LoadNote);
+
+		config.For("cpu").Crit = 80;
+		Assert.True(config.KeepInOrder("cpu", 70, 85));
+		Assert.Equal(80, config.Get("cpu").Crit);
+
+		// A metric that never alarms on its own: a lone red threshold there can never be reached.
+		config.For("vol.C:").Crit = 100;
+		Assert.False(config.KeepInOrder("vol.C:", Alarm.Never, Alarm.Never));
+	}
+
+	/// <summary>
+	/// After a start on defaults, a restored file's slot table wins: the one in memory was built in
+	/// the order the sources answered, with no history behind it.
+	/// </summary>
+	[Fact]
+	public void SlotsFromAStartOnDefaultsOnlyAddWhatTheFileDoesNotContradict()
+	{
+		var g1 = "6f2a1c40-9d3b-4f7e-a1c2-7c9e5b000051";
+		var g2 = "6f2a1c40-9d3b-4f7e-a1c2-7c9e5b000052";
+		var g3 = "6f2a1c40-9d3b-4f7e-a1c2-7c9e5b000053";
+		var file = new Config();
+		file.Slots["net"] = new Dictionary<string, string> { ["A"] = g2, ["B"] = g1 };
+		var memory = new Dictionary<string, Dictionary<string, string>>
+		{
+			["net"] = new() { ["A"] = g1, ["C"] = g3, ["D"] = g2 },
+			["vol"] = new() { ["C:"] = g1 },
+		};
+		file.AddSlotsFrom(memory);
+		Assert.Equal(g2, file.Slots["net"]["A"]);          // the file's history wins
+		Assert.Equal(g3, file.Slots["net"]["C"]);          // a newcomer nobody contradicts is kept
+		Assert.False(file.Slots["net"].ContainsKey("D"));  // its GUID belongs to A in the file
+		Assert.Equal(g1, file.Slots["vol"]["C:"]);
+		Assert.True(file.TakeDirty());
 	}
 
 	/// <summary>Gigabytes left: the red threshold is the lower number, so the check is reversed.</summary>

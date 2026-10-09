@@ -74,7 +74,7 @@ public sealed class DiskSensor
 				if (handle == IntPtr.Zero || handle == new IntPtr(-1)) continue;
 				opened++;
 
-				var temp = Temperature(handle);
+				var temp = Temperature(handle, out var limits);
 				if (temp is null) continue;
 				var (name, serial) = Describe(handle);
 				name ??= "Диск " + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -83,7 +83,7 @@ public sealed class DiskSensor
 				// "name|temperature|index", and the index made it unique on every iteration, so
 				// it deduplicated nothing at all.
 				if (!seen.Add(string.IsNullOrEmpty(serial) ? name + "|" + i : serial)) continue;
-				disks.Add(new DiskReading(name, temp.Value, null, null) { Serial = serial });
+				disks.Add(new DiskReading(name, temp.Value, null, null) { Serial = serial, Limits = limits });
 			}
 			catch (Exception ex)
 			{
@@ -106,16 +106,18 @@ public sealed class DiskSensor
 	}
 
 	/// <summary>
-	/// Composite temperature of the drive. The buffer is decoded by
+	/// Composite temperature of the drive, and its own warning and critical temperatures when it
+	/// reports them — they come in the same answer. The buffer is decoded by
 	/// <see cref="StorageTemperature"/>, which is checked against crafted answers rather than
 	/// against a disk — the layout was wrong here for a long time and nothing could see it.
 	/// </summary>
-	private static double? Temperature(IntPtr handle)
+	private static double? Temperature(IntPtr handle, out (double Warn, double Crit)? limits)
 	{
+		limits = null;
 		var output = new byte[512];
-		return Query(handle, StorageDeviceTemperatureProperty, output, out var returned)
-			? StorageTemperature.Parse(output, returned)
-			: null;
+		if (!Query(handle, StorageDeviceTemperatureProperty, output, out var returned)) return null;
+		limits = StorageTemperature.Limits(output, returned);
+		return StorageTemperature.Parse(output, returned);
 	}
 
 	/// <summary>

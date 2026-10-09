@@ -196,14 +196,25 @@ public sealed class SnmpParserTests
 /// <summary>The PowerNet status codes, which decide the colour of the plate.</summary>
 public sealed class UpsStatusTests
 {
+	/// <summary>
+	/// "On battery" means the mains is gone. A self-test (15) runs on battery by design and only
+	/// with the mains present; counting it sent "switched to battery" as an Error event and "mains
+	/// restored" a poll later, every couple of weeks, for an outage that never happened.
+	/// </summary>
 	[Theory]
 	[InlineData(3, true)]     // onBattery
-	[InlineData(15, true)]    // onBatteryTest
+	[InlineData(15, false)]   // onBatteryTest — not an outage
 	[InlineData(2, false)]    // onLine
 	[InlineData(4, false)]    // AVR boost — not battery, but not healthy either
 	[InlineData(10, false)]   // hardware failure bypass
-	public void OnBatteryIsOnlyTheTwoStatesThatAre(int status, bool expected) =>
+	public void OnBatteryIsOnlyAMainsOutage(int status, bool expected) =>
 		Assert.Equal(expected, new UpsReading { Status = status }.OnBattery);
+
+	[Theory]
+	[InlineData(6, true)] [InlineData(9, true)] [InlineData(10, true)] [InlineData(16, true)] [InlineData(17, true)]
+	[InlineData(4, false)] [InlineData(12, false)] [InlineData(2, false)] [InlineData(15, false)]
+	public void BypassIsTheFiveBypassStatesAndNotAvr(int status, bool expected) =>
+		Assert.Equal(expected, new UpsReading { Status = status }.Bypass);
 
 	/// <summary>
 	/// unknown(1) and a missing OID both mean "nothing is known". Reading either as mains power

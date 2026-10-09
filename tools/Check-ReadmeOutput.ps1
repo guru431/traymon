@@ -7,7 +7,8 @@
     там, где программа выдавала 2384, и `disk.<номер>` там, где идентификатор давно другой.
     Скрипт не сравнивает числа — они у каждого свои — а проверяет, что набор *подписей*
     строк совпадает: каждая метка, которую печатает сборка, встречается в примере README,
-    и наоборот.
+    и наоборот. Вторым проходом то же делается для примера `--once --icons`: виды строк
+    отчёта слоя иконок и семейства слотов.
 
     Запускается вручную и перед публикацией (`/github-push`). Ничего не правит.
 
@@ -105,16 +106,101 @@ $optional = @('GPU', 'GPU N mem', 'GPU N fan', 'raid', 'ups', 'disk', 'fan', 'ba
 $stale = $stale | Where-Object { $_ -notin $optional }
 $missing = $missing | Where-Object { $_ -notin $optional }
 
+$failed = $false
 if ($missing) {
     Write-Host "`nЕсть в выводе, нет в README:" -ForegroundColor Yellow
     $missing | ForEach-Object { Write-Host "  $_" }
+    $failed = $true
 }
 if ($stale) {
     Write-Host "`nЕсть в README, нет в выводе (и это не опциональное железо):" -ForegroundColor Yellow
     $stale | ForEach-Object { Write-Host "  $_" }
+    $failed = $true
 }
-if (-not $missing -and -not $stale) {
-    Write-Host "`nПример в README совпадает с выводом по составу строк." -ForegroundColor Green
+if (-not $failed) { Write-Host "`nПример --once в README совпадает с выводом по составу строк." -ForegroundColor Green }
+
+# ---- Второй проход: пример `--once --icons` ----
+#
+# Формат отчёта слоя иконок уже менялся (код возврата, строка `shell not touched`), а сверял
+# скрипт только `--once`. Здесь каждая строка отчёта относится к одному виду: переход по тикам,
+# итог `icons:`, строка слота, `shell not touched`, `tick N ms`, `last error`. Строка, которая ни
+# к одному виду не подходит, — расхождение формата, где бы она ни нашлась. Виды строк сверяются в
+# обе стороны. Слоты — только в одну: пример в README намеренно короткий, но каждое семейство в нём
+# обязано существовать в выводе (или быть железом, которого на этой машине может не быть), —
+# так ловится идентификатор старой схемы вроде `disk.0`.
+function Get-Family([string]$id) {
+    foreach ($prefix in 'gpu.temp.', 'fan.gpu.', 'disk.raid.', 'gpu.', 'vram.', 'disk.', 'fan.', 'net.', 'vol.', 'free.') {
+        if ($id.StartsWith($prefix)) { return "$prefix*" }
+    }
+    return $id
+}
+
+function Get-IconLabels([string[]]$lines) {
+    $labels = @()
+    $started = $false
+    foreach ($line in $lines) {
+        if ($line -notmatch '\S') { continue }
+        # Отчёт слоя иконок начинается с первого перехода или с итоговой строки.
+        if (-not $started) {
+            if ($line -match '^\s*tick \d+:' -or $line -match '^icons: ') { $started = $true } else { continue }
+        }
+        if ($line -match '^\s*tick \d+:') { $labels += 'tick N:'; continue }
+        if ($line -match '^icons: ') { $labels += (($line -replace '\d+', 'N') -replace '\s+', ' ').Trim(); continue }
+        if ($line -match '^\s+(on|off)\s+[0-9A-Fa-f]{2}\s+(\S+)') { $labels += 'slot ' + (Get-Family $Matches[2]); continue }
+        if ($line -match '^shell not touched') { $labels += 'shell not touched'; continue }
+        if ($line -match '^tick [\d.]+ ms') { $labels += 'tick N ms'; continue }
+        if ($line -match '^\s+last error:') { $labels += 'last error'; continue }
+        if ($line -match ': без значка осталось') { $labels += 'overflow'; continue }
+        $labels += "?? $($line.Trim())"
+    }
+    $labels | Sort-Object -Unique
+}
+
+Write-Host "`nЗапуск: dotnet $Dll --once --icons --ticks 2"
+$ErrorActionPreference = "Continue"
+$iconsOutput = & dotnet $Dll --once --icons --ticks 2 2>&1 | ForEach-Object { "$_" }
+$iconsExit = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+if ($iconsExit -ne 0) {
+    Write-Host "`n--once --icons вернул код ${iconsExit}: слой иконок бросил исключение." -ForegroundColor Yellow
+    $failed = $true
+}
+
+$iconsExample = $blocks | Where-Object { ($_ -join "`n") -match '(?m)^icons: \d+ shown of' } | Select-Object -First 1
+if (-not $iconsExample) { throw "В $Readme нет блока с примером вывода --once --icons (ищется строка 'icons: N shown of')" }
+
+$fromCode = Get-IconLabels $iconsOutput
+$fromDocs = Get-IconLabels $iconsExample
+$optionalKinds = @('tick N:', 'last error', 'overflow')
+$optionalFamilies = @('gpu.*', 'vram.*', 'gpu.temp.*', 'fan.gpu.*', 'disk.*', 'disk.raid.*', 'fan.*',
+                      'net.*', 'vol.*', 'free.*', 'cpu.temp', 'ups', 'battery')
+
+$missing = $fromCode | Where-Object {
+    $_ -notlike 'slot *' -and $_ -notlike '?? *' -and $_ -notin $fromDocs -and $_ -notin $optionalKinds
+}
+$stale = $fromDocs | Where-Object {
+    if ($_ -like 'slot *') { $_ -notin $fromCode -and $_.Substring(5) -notin $optionalFamilies }
+    else { $_ -notin $fromCode -and $_ -notin $optionalKinds }
+}
+$unknown = $fromCode | Where-Object { $_ -like '?? *' }
+
+if ($missing) {
+    Write-Host "`n--icons: вид строки есть в выводе, нет в README:" -ForegroundColor Yellow
+    $missing | ForEach-Object { Write-Host "  $_" }
+    $failed = $true
+}
+if ($stale) {
+    Write-Host "`n--icons: есть в README, нет в выводе (и это не опциональное железо):" -ForegroundColor Yellow
+    $stale | ForEach-Object { Write-Host "  $_" }
+    $failed = $true
+}
+if ($unknown) {
+    Write-Host "`n--icons: строки, формат которых скрипт не знает, — поправьте его вместе с README:" -ForegroundColor Yellow
+    $unknown | ForEach-Object { Write-Host "  $_" }
+    $failed = $true
+}
+if (-not $failed) {
+    Write-Host "`nПример --once --icons в README совпадает с выводом по виду строк и семействам слотов." -ForegroundColor Green
     exit 0
 }
 Write-Host "`nПоправьте пример в README.md (и, если строка описана и там, в README.en.md)."

@@ -20,11 +20,17 @@ namespace TrayMon;
 /// as "the description for event ID cannot be found".
 ///
 /// Transitions happen once in months. Nothing here runs on a tick.
+///
+/// So does the start and the stop of the program itself, as Information. Silence in the log reads
+/// the same whether everything is fine or TrayMon is not running at all — a crash takes the icons
+/// away without a trace, and the logon task starts nothing after an unattended reboot — so a
+/// monitoring system can only tell the two apart by "no start event after the boot". The start
+/// event also tries the channel at once, instead of after the first alarm that failed to arrive.
 /// </summary>
 internal static class WindowsLog
 {
 	private const string Source = "TrayMon";
-	private const ushort EventTypeWarning = 2, EventTypeError = 1;
+	private const ushort EventTypeWarning = 2, EventTypeError = 1, EventTypeInformation = 4;
 
 	/// <summary>Event id 1000, the generic "information" string in EventCreate's message table.</summary>
 	private const uint GenericEventId = 1000;
@@ -47,7 +53,13 @@ internal static class WindowsLog
 	/// <summary>Why the last write did not happen; shown in the diagnostics window.</summary>
 	public static string LastError { get; private set; }
 
-	public static void Write(string message, bool critical)
+	public static void Write(string message, bool critical) =>
+		Write(message, critical ? EventTypeError : EventTypeWarning);
+
+	/// <summary>An event that is not a problem: the program starting or stopping.</summary>
+	public static void Note(string message) => Write(message, EventTypeInformation);
+
+	private static void Write(string message, ushort type)
 	{
 		var handle = IntPtr.Zero;
 		try
@@ -60,7 +72,7 @@ internal static class WindowsLog
 							Marshal.GetLastWin32Error().ToString(System.Globalization.CultureInfo.InvariantCulture) + ")";
 				return;
 			}
-			if (!ReportEventW(handle, critical ? EventTypeError : EventTypeWarning, 0, GenericEventId,
+			if (!ReportEventW(handle, type, 0, GenericEventId,
 							  IntPtr.Zero, 1, 0, new[] { message }, IntPtr.Zero))
 				LastError = "журнал Windows: запись не принята (код " +
 							Marshal.GetLastWin32Error().ToString(System.Globalization.CultureInfo.InvariantCulture) + ")";

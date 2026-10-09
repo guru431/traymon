@@ -3,9 +3,9 @@ using System.Runtime.InteropServices;
 namespace TrayMon;
 
 /// <summary>
-/// Thin wrapper over PDH. One query holds many counters and a single collect refreshes all of
-/// them, which is why CPU, network and disks share one: six counters cost 4.1 ms per collect
-/// against 1.7 ms for the CPU counter alone.
+/// Thin wrapper over PDH. One query holds many counters and a single collect refreshes every
+/// object they name — which is also why a query is collected exactly as often as it is read:
+/// see <see cref="PerfSensors"/>.
 /// </summary>
 public sealed unsafe class PdhQuery : IDisposable
 {
@@ -137,7 +137,17 @@ public sealed unsafe class PdhQuery : IDisposable
 
 /// <summary>
 /// CPU load, network throughput and per-volume disk throughput — everything that comes from
-/// performance counters, in one query and one collect per tick.
+/// performance counters.
+///
+/// Three queries, each collected only when it is read. A rate counter is the difference between
+/// the last two collects, so network and volumes used to share the CPU query, be collected on
+/// every tick and be read on every third: the icons, the five-minute line, the CSV trail and the
+/// bandwidth thresholds all saw the last two seconds of every six, and two collects of the
+/// Network Interface and LogicalDisk objects out of three were thrown away. In a query of their
+/// own the rate covers the whole interval — which also means a short burst shows as its average
+/// over those six seconds. Measured, median of fifteen rounds of forty: one collect of the CPU
+/// counter alone 0.04 M cycles (0.2 ms), of the network and volume objects 2.6 M (1.5 ms), of all
+/// six together 2.8 M (2 ms) — so six seconds cost 2.7 M cycles of collects instead of 8.4 M.
 ///
 /// CPU deliberately uses the hypervisor counter: on a Hyper-V host the plain \Processor counter
 /// only sees the root partition — it read 13 % while the machine was actually 65 % busy.
@@ -148,6 +158,7 @@ public sealed class PerfSensors : IDisposable
 	private const string PlainCpu = @"\Processor Information(_Total)\% Processor Time";
 
 	private readonly PdhQuery _query = new();
+	private readonly PdhQuery _ioQuery = new();
 	private readonly PdhQuery _processQuery = new();
 	private readonly IntPtr _cpu, _netIn, _netOut, _netBandwidth, _diskRead, _diskWrite, _processIo;
 
@@ -203,12 +214,13 @@ public sealed class PerfSensors : IDisposable
 			if (_cpu != IntPtr.Zero) CounterInUse = PlainCpu;
 		}
 
-		_netIn = _query.Add(@"\Network Interface(*)\Bytes Received/sec");
-		_netOut = _query.Add(@"\Network Interface(*)\Bytes Sent/sec");
-		_netBandwidth = _query.Add(@"\Network Interface(*)\Current Bandwidth");
-		_diskRead = _query.Add(@"\LogicalDisk(*)\Disk Read Bytes/sec");
-		_diskWrite = _query.Add(@"\LogicalDisk(*)\Disk Write Bytes/sec");
+		_netIn = _ioQuery.Add(@"\Network Interface(*)\Bytes Received/sec");
+		_netOut = _ioQuery.Add(@"\Network Interface(*)\Bytes Sent/sec");
+		_netBandwidth = _ioQuery.Add(@"\Network Interface(*)\Current Bandwidth");
+		_diskRead = _ioQuery.Add(@"\LogicalDisk(*)\Disk Read Bytes/sec");
+		_diskWrite = _ioQuery.Add(@"\LogicalDisk(*)\Disk Write Bytes/sec");
 		_query.Collect();   // first collect only establishes the baseline
+		_ioQuery.Collect();
 
 		// Kept in its own query: ~250 instances are not worth collecting on every tick.
 		_processIo = _processQuery.Add(@"\Process(*)\IO Data Bytes/sec");
@@ -229,9 +241,8 @@ public sealed class PerfSensors : IDisposable
 	public static double ReadUptime() => Environment.TickCount64 / 3_600_000.0;
 
 	/// <summary>
-	/// Refreshes CPU always; network and volumes only when asked. The collect itself is cheap
-	/// — what costs is walking the wildcard arrays, so the caller does that at a third of the
-	/// tick rate. Uptime is not here: see <see cref="ReadUptime"/>.
+	/// Refreshes CPU always; network and volumes only when asked, and only then is their query
+	/// collected. Uptime is not here: see <see cref="ReadUptime"/>.
 	/// </summary>
 	public void Read(Readings r, bool includeIo)
 	{
@@ -240,6 +251,7 @@ public sealed class PerfSensors : IDisposable
 		var cpu = _query.Read(_cpu);
 		r.CpuLoad = cpu.HasValue ? Math.Clamp(cpu.Value, 0, 100) : null;
 		if (!includeIo) return;
+		_ioQuery.Collect();
 
 		const double mb = 1024.0 * 1024;
 		// Decimal, not binary, for anything that ends up drawn in megabits: a link is rated in
@@ -250,9 +262,9 @@ public sealed class PerfSensors : IDisposable
 		// Link speed comes from the same counters as the traffic: on a Hyper-V host the physical
 		// NIC belongs to the external switch and does not appear among .NET network interfaces
 		// at all — only "vEthernet (...)" does.
-		_query.ReadArray(_netIn, _in);
-		_query.ReadArray(_netOut, _out);
-		_query.ReadArray(_netBandwidth, _bandwidth);
+		_ioQuery.ReadArray(_netIn, _in);
+		_ioQuery.ReadArray(_netOut, _out);
+		_ioQuery.ReadArray(_netBandwidth, _bandwidth);
 
 		r.Nets.Clear();
 		_adapters.Clear();
@@ -264,22 +276,25 @@ public sealed class PerfSensors : IDisposable
 			_adapters.Add(x.Instance);
 			var outMb = _sentBy.TryGetValue(x.Instance, out var o) ? o / netMb : 0;
 			var linkMb = _bandwidthBy.TryGetValue(x.Instance, out var b) ? b / 8 / netMb : 0;
+			var inMb = x.Value / netMb;
+			// An unplugged adapter reports zero bandwidth; one that carries traffic is kept even
+			// then, so a driver that does not fill Current Bandwidth in cannot hide its icon.
+			// Decided on what was measured, before the configured figure below: deciding after it
+			// kept a Wi-Fi out of range or an unplugged cable alive as "0 · 0 % of 1200 Mbit/s" in
+			// its normal colour for as long as PDH listed the adapter.
+			if (linkMb <= 0 && inMb <= 0 && outMb <= 0) continue;
 			// A configured link speed wins. Current Bandwidth is missing on some drivers and
 			// meaningless on Wi-Fi (it is the momentary rate, not a capacity), and without a
 			// figure to divide by the utilisation reads 0 % — which looks like an idle line
 			// rather than like an unknown one.
 			var configured = _net?.BandwidthFor(x.Instance);
 			if (configured.HasValue) linkMb = configured.Value / 8;
-			var inMb = x.Value / netMb;
-			// An unplugged adapter reports zero bandwidth; one that carries traffic is kept even
-			// then, so a driver that does not fill Current Bandwidth in cannot hide its icon.
-			if (linkMb <= 0 && inMb <= 0 && outMb <= 0) continue;
 			r.Nets.Add((x.Instance, inMb, outMb, linkMb));
 		}
 		r.Nets.Sort(ByNetName);
 
-		_query.ReadArray(_diskRead, _reads);
-		_query.ReadArray(_diskWrite, _writes);
+		_ioQuery.ReadArray(_diskRead, _reads);
+		_ioQuery.ReadArray(_diskWrite, _writes);
 		Index(_writes, _writtenBy);
 		r.Volumes.Clear();
 		foreach (var x in _reads)
@@ -378,6 +393,7 @@ public sealed class PerfSensors : IDisposable
 	public void Dispose()
 	{
 		_query.Dispose();
+		_ioQuery.Dispose();
 		_processQuery.Dispose();
 	}
 }
