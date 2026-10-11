@@ -674,14 +674,7 @@ internal static class Autostart
 		}
 		if (LastCheckError is not null) errors.Add(LastCheckError);
 
-		var files = new List<string>();
-		if (ExePath is not null) files.Add(ExePath);
-		if (File.Exists(Config.Path)) files.Add(Config.Path);
-		if (!string.IsNullOrWhiteSpace(smartctl)) files.Add(smartctl);
-		try { files.AddRange(Directory.EnumerateFiles(folder, "*.dll")); }
-		catch (Exception ex) { errors.Add(ex.GetType().Name + ": " + ex.Message); }
-
-		foreach (var file in files)
+		foreach (var file in LoadPath(folder, smartctl, errors))
 		{
 			if (!UnsafeToRun(file, out var fileWho))
 			{
@@ -695,6 +688,47 @@ internal static class Autostart
 
 		LastCheckError = errors.Count > 0 ? errors[0] : null;
 		return false;
+	}
+
+	/// <summary>The files <see cref="InstallUnsafe"/> speaks for. One list, so that what is
+	/// reported about them cannot drift away from what is checked.</summary>
+	private static List<string> LoadPath(string folder, string smartctl, List<string> errors)
+	{
+		var files = new List<string>();
+		if (ExePath is not null) files.Add(ExePath);
+		if (File.Exists(Config.Path)) files.Add(Config.Path);
+		if (!string.IsNullOrWhiteSpace(smartctl)) files.Add(HddSensor.PathOf(smartctl));
+		try { files.AddRange(Directory.EnumerateFiles(folder, "*.dll")); }
+		catch (Exception ex) { errors?.Add(ex.GetType().Name + ": " + ex.Message); }
+		return files;
+	}
+
+	/// <summary>
+	/// The files of the load path that belong to none of the administrative accounts, by owner.
+	/// <see cref="OwnerOf"/> one level down, and reported rather than enforced for the same reason:
+	/// the owner of a file can grant themselves the write its ACL withholds, and the ACL check
+	/// above cannot see that — but whether an arbitrary SID is an administrator cannot be decided
+	/// from here either. Until this, a file's owner was neither checked nor shown.
+	/// </summary>
+	public static Dictionary<string, List<string>> ForeignOwners(string smartctl)
+	{
+		var found = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+		var folder = ExePath is null ? AppContext.BaseDirectory : Path.GetDirectoryName(ExePath);
+		foreach (var file in LoadPath(folder, smartctl, errors: null))
+		{
+			try
+			{
+				var info = new FileInfo(file);
+				if (!info.Exists) continue;
+				var owner = info.GetAccessControl(AccessControlSections.Owner).GetOwner(typeof(SecurityIdentifier));
+				if (owner is not SecurityIdentifier sid || Trusted(sid)) continue;
+				var who = Describe(sid);
+				if (!found.TryGetValue(who, out var files)) found[who] = files = new List<string>();
+				files.Add(info.Name);
+			}
+			catch (Exception) { /* an owner that cannot be read is nobody's to report */ }
+		}
+		return found;
 	}
 
 	private static bool LooseFile(FileInfo file, out string who)
@@ -758,6 +792,9 @@ internal static class Autostart
 	private static bool Trusted(SecurityIdentifier sid) =>
 		sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) ||
 		sid.IsWellKnown(WellKnownSidType.LocalSystemSid) ||
+		// A placeholder, not an account: no token carries it, so an entry naming it grants nothing
+		// on the object it sits on. What it turns into on a child is an entry for that child's
+		// owner by SID — which is judged here like any other.
 		sid.IsWellKnown(WellKnownSidType.CreatorOwnerSid) ||
 		// TrustedInstaller owns most of %ProgramFiles%.
 		sid.Value == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";

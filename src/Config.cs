@@ -398,6 +398,11 @@ public sealed class Config : IGuidStore
 		{
 			if (File.Exists(Path))
 			{
+				// The stamp before the text, not after it. A save that lands while the file is being
+				// read and parsed is then newer than the stamp and gets read again; taken afterwards,
+				// the stamp was that save's own write time, the edit counted as already seen, and the
+				// next Save went over it — the loss the stamp is there to prevent.
+				var stamp = File.GetLastWriteTimeUtc(Path);
 				var config = JsonSerializer.Deserialize<Config>(File.ReadAllText(Path), JsonOptions) ?? new Config();
 				// Any of these can be an explicit null in a hand-edited file, and a null Icons
 				// used to take the program down on the first tick rather than at load time.
@@ -413,7 +418,7 @@ public sealed class Config : IGuidStore
 				foreach (var key in config.Slots.Where(p => p.Value is null).Select(p => p.Key).ToList())
 					config.Slots[key] = new Dictionary<string, string>(StringComparer.Ordinal);
 				config.Validate();
-				config.Stamp = File.GetLastWriteTimeUtc(Path);
+				config.Stamp = stamp;
 				return config;
 			}
 		}

@@ -78,11 +78,12 @@ public sealed class DiskSensor
 				if (temp is null) continue;
 				var (name, serial) = Describe(handle);
 				name ??= "Диск " + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
-				// The same disk can appear twice behind a multipath or virtual controller. By
-				// serial number where the driver gives one: the old key was
-				// "name|temperature|index", and the index made it unique on every iteration, so
-				// it deduplicated nothing at all.
-				if (!seen.Add(string.IsNullOrEmpty(serial) ? name + "|" + i : serial)) continue;
+				// The same disk can appear twice behind a multipath or virtual controller, and
+				// only a serial number can show it: the old key was "name|temperature|index", and
+				// the index made it unique on every iteration, so it deduplicated nothing at all.
+				// A drive that gives no serial is always kept. Two of one model that both withhold
+				// it look exactly like one seen twice, and dropping by name would hide a real disk.
+				if (!string.IsNullOrEmpty(serial) && !seen.Add(serial)) continue;
 				disks.Add(new DiskReading(name, temp.Value, null, null) { Serial = serial, Limits = limits });
 			}
 			catch (Exception ex)

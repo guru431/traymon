@@ -706,6 +706,13 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// sources that have not turned up — see <see cref="ExpectRequired"/>.</summary>
 	private readonly (string Prefix, Metric Metric, GuidPool Pool)[] _pooledFamilies;
 
+	/// <summary>
+	/// Required ids that <see cref="Expect"/> has no placeholder for — an id in an older scheme, a
+	/// prefix no family owns. Remembered until the settings are replaced: such an entry never gets a
+	/// slot, so the search for missing ones found it again, and allocated its list, on every tick.
+	/// </summary>
+	private readonly HashSet<string> _neverExpected = new(StringComparer.Ordinal);
+
 	private readonly PerfSensors _perf;
 	private readonly GpuSensor _gpu;
 	private readonly LhmSensor _lhm;
@@ -813,7 +820,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// instead of waiting for the next deadline of every source in turn.</summary>
 	private bool _catchUp;
 
-	/// <summary>Lines written to the CSV trail but not yet on disk, and how many were dropped
+	/// <summary>Batches written to the CSV trail but not yet on disk, and how many were dropped
 	/// because the writer was still busy. See <see cref="WriteLogLine"/>.</summary>
 	private readonly Queue<string> _logQueue = new();
 	private int _logWriting;
@@ -1401,21 +1408,25 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	{
 		var missing = false;
 		foreach (var (id, settings) in _config.Icons)
-			if (settings?.Required == true && !_slots.ContainsKey(id)) { missing = true; break; }
+			if (Awaited(id, settings)) { missing = true; break; }
 		if (!missing) return;   // the ordinary case, and it allocates nothing
 
-		var ids = _config.Icons.Where(p => p.Value?.Required == true && !_slots.ContainsKey(p.Key))
-			.Select(p => p.Key).ToList();
-		foreach (var id in ids) Expect(id);
+		var ids = _config.Icons.Where(p => Awaited(p.Key, p.Value)).Select(p => p.Key).ToList();
+		foreach (var id in ids)
+			if (!Expect(id)) _neverExpected.Add(id);
 	}
 
-	private void Expect(string id)
+	private bool Awaited(string id, IconSettings settings) =>
+		settings?.Required == true && !_slots.ContainsKey(id) && !_neverExpected.Contains(id);
+
+	/// <returns>False when this id can never be given a placeholder, whatever turns up.</returns>
+	private bool Expect(string id)
 	{
 		switch (id)
 		{
-			case "cpu.temp": Slot(id, CpuTempMetric, CpuTempGuid); return;
-			case "ups": Slot(id, UpsMetric, UpsGuid); return;
-			case "battery": Slot(id, BatteryMetric, BatteryGuid); return;
+			case "cpu.temp": Slot(id, CpuTempMetric, CpuTempGuid); return true;
+			case "ups": Slot(id, UpsMetric, UpsGuid); return true;
+			case "battery": Slot(id, BatteryMetric, BatteryGuid); return true;
 		}
 		foreach (var (prefix, metric, pool) in _pooledFamilies)
 		{
@@ -1425,10 +1436,12 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			// Ids in an older scheme are carried over by Migrate when their source turns up, and a
 			// placeholder under the old id would stay behind as a grey ghost holding a GUID.
 			var old = pool.Id == "fan" ? !key.Contains('/') : card && key.All(char.IsDigit);
-			if (key.Length == 0 || old) return;
+			if (key.Length == 0 || old) return false;
+			// Null when the pool is full: a slot can still come free, so that id is asked again.
 			Pooled(id, metric, pool, key, pool.Id == "free" ? $"Свободно {key}" : card ? metric.Label : key);
-			return;
+			return true;
 		}
+		return false;
 	}
 
 	/// <summary>
@@ -2644,6 +2657,9 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// after an NTP correction or a resume — stopped the log for however long the step was.
 		var now = Environment.TickCount64;
 		if (now - _lastLogAt < _config.Log.EverySeconds * 1000L) return;
+		// Moved on whether or not the batch gets through below. One that is dropped was this
+		// interval's sample; coming back for it on the next tick would build these rows every two
+		// seconds for a writer that is not taking them, and put the sample off the grid anyway.
 		_lastLogAt = now;
 
 		var ci = CultureInfo.InvariantCulture;
@@ -2681,7 +2697,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// Off the UI thread. File.AppendAllText on a log redirected to a network share, or on a
 		// disk a scanner is busy with, blocked the timer — and with it every metric, the menu and
 		// the delivery of events — for as long as the write took. The queue is bounded by one
-		// batch in flight: a writer that cannot keep up drops rows and says how many.
+		// batch in flight: a writer that cannot keep up drops batches and says how many.
 		lock (_logQueue)
 		{
 			if (_logQueue.Count >= 4) { _logDropped++; return; }
@@ -3668,6 +3684,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		else fresh.Slots = _config.Slots;
 		if (_config.TakeDirty()) _configDirty = true;
 		_config = fresh;
+		_neverExpected.Clear();   // the file may mark other ids as required now
 	}
 
 	/// <summary>
@@ -3896,6 +3913,11 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// normal installation that owner is the administrator who created the folder.
 		var owner = Autostart.OwnerOf(folder);
 		if (owner is not null) text.AppendLine($"                  владелец папки: {owner}");
+		// The same for the files, and only the ones that stand out: owned by the administrators
+		// group, as an elevated copy leaves them, they are not worth a line.
+		foreach (var (account, files) in Autostart.ForeignOwners(_config.Tools?.Smartctl))
+			text.AppendLine($"                  владелец {account} (может сам выдать себе запись): " +
+							string.Join(", ", files));
 		text.AppendLine();
 		// Registered, not merely created: a shell that refuses or times out leaves an icon object
 		// behind that shows nothing, and "показано 17" was the same number either way.
@@ -3948,8 +3970,11 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		text.AppendLine($"вызовов в трей:   {TrayValueIcon.ShellCalls.ToString(ci)} " +
 						$"({(_tick > 0 ? (TrayValueIcon.ShellCalls / (double)_tick) : 0).ToString("0.00", ci)} на тик)");
 		text.AppendLine($"ошибок за сеанс:  {_tickErrors.ToString(ci)}");
+		// Since the start, and never reset: the moment the share answers again is the moment somebody
+		// opens this window to find out how much of the night is missing. A batch is one interval —
+		// a row per icon — so it is intervals that are counted, not rows.
 		if (_logDropped > 0)
-			text.AppendLine($"журнал CSV:       строк потеряно {_logDropped.ToString(ci)} — запись не успевает");
+			text.AppendLine($"журнал CSV:       за сеанс пропущено интервалов: {_logDropped.ToString(ci)} — запись не успевала");
 		if (_config.Log.Enabled && _logRefusal is { } refusal)
 			text.AppendLine($"журнал CSV:       {refusal}");
 		if (_lastTickError is not null) text.AppendLine($"последняя:        {_lastTickError}");

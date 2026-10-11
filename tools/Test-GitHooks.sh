@@ -41,6 +41,7 @@ check() {
 }
 
 # Called directly, not as $(new_repo): the trap has to be set in this shell, not in a subshell.
+# Called once: every case below shares that one repository, so the one trap covers all there is.
 new_repo() {
   repo=$(mktemp -d)
   # Removed on any exit, not only at the end: under `set -eu` an unguarded failure part-way

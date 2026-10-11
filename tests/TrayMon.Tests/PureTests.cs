@@ -621,3 +621,28 @@ public sealed class DiskMergeTests
 		Assert.Same(library, Program.Merge(new List<DiskReading>(), library));
 	}
 }
+
+/// <summary>
+/// One answer to "which file is <c>Tools.Smartctl</c>", for the sensor that starts it and for the
+/// install check that vets it. The check used to take the configured text as written, so a relative
+/// path was looked up under the working directory — %SystemRoot%\System32 under the logon task.
+/// </summary>
+public sealed class SmartctlPathTests
+{
+	[Theory]
+	[InlineData(null)]
+	[InlineData("")]
+	[InlineData("  ")]
+	public void NothingConfiguredIsTheCopyBesideTheProgram(string configured) =>
+		Assert.Equal(Path.Combine(AppContext.BaseDirectory, "smartctl.exe"), HddSensor.PathOf(configured));
+
+	[Fact]
+	public void ARelativePathIsUnderTheProgramFolderNotTheWorkingDirectory() =>
+		Assert.Equal(Path.Combine(AppContext.BaseDirectory, @"tools\smartctl.exe"),
+					 HddSensor.PathOf(@"tools\smartctl.exe"));
+
+	[Fact]
+	public void AFullPathIsLeftAlone() =>
+		Assert.Equal(@"C:\Program Files\smartmontools\bin\smartctl.exe",
+					 HddSensor.PathOf(@"C:\Program Files\smartmontools\bin\smartctl.exe"));
+}

@@ -176,7 +176,8 @@
   недоступной на запись обычному пользователю: `Autostart.InstallUnsafe` обходит всех предков до
   корня тома (у них маска уже: `DeleteSubdirectoriesAndFiles`, `ChangePermissions`,
   `TakeOwnership`) и сами файлы (exe, DLL рядом, `TrayMon.json`, указанный в нём smartctl).
-  Непрочитанный ACL запрещает. `Autostart.OwnerOf` владельца показывает, но не блокирует.
+  Непрочитанный ACL запрещает. Владельца «Диагностика…» показывает, но не блокирует: папки —
+  `Autostart.OwnerOf`, файлов того же списка — `ForeignOwners` (только не административных).
 - Задача и ярлык принадлежат установке: `Enable` не перезаписывает чужую задачу без
   подтверждения, `Disable`/`Uninstall` её не удаляют, ярлык удаляется после проверки `TargetPath`.
   Состояние — `Autostart.State` (действие, `Enabled`, logon-триггер, учётная запись); галочка
@@ -185,7 +186,8 @@
   `Autostart.ExePath` ищет apphost; без него установочные действия отказываются.
 - Внешние программы — по полному пути (`%SystemRoot%\System32\notepad.exe`); `nvml.dll` — через
   `NativeLibrary.SetDllImportResolver`, который при ненахождении **бросает**, а не возвращает
-  `IntPtr.Zero`. Относительные `Tools.Smartctl` и `Log.Path` — от папки программы.
+  `IntPtr.Zero`. Относительные `Tools.Smartctl` и `Log.Path` — от папки программы; путь к smartctl
+  разрешает одна `HddSensor.PathOf` — и для запуска, и для проверки установки.
 - `smartctl.exe` не запускается, только если папка программы защищена, а инструмент из
   `TrayMon.json` лежит в более слабом месте; иначе запуск и запись в `HddSensor.Note`. То же
   правило у CSV-журнала по `Log.Path` (`LogRefused`). `WritableByNonAdmins`/`UnsafeToRun`

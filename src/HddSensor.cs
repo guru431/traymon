@@ -57,19 +57,29 @@ public sealed class HddSensor
 
 	public HddSensor(ToolSettings tools = null)
 	{
-		// README calls smartctl an optional external tool, so where it lives is a setting;
-		// empty means the copy next to TrayMon.exe, which is the normal case. A relative path is
-		// resolved against the program folder and never against the working directory — under
-		// the logon task that directory is %SystemRoot%\System32, and this process holds an
-		// elevated token, so "smartctl.exe" would have meant "whatever is in System32".
-		var configured = tools?.Smartctl;
-		_exe = string.IsNullOrWhiteSpace(configured)
+		_exe = PathOf(tools?.Smartctl);
+		_scanArgs = tools?.SmartctlScan ?? "--scan-open -d csmi";
+	}
+
+	/// <summary>
+	/// The file a configured <c>Tools.Smartctl</c> stands for. README calls smartctl an optional
+	/// external tool, so where it lives is a setting; empty means the copy next to TrayMon.exe,
+	/// which is the normal case. A relative path is resolved against the program folder and never
+	/// against the working directory — under the logon task that directory is
+	/// %SystemRoot%\System32, and this process holds an elevated token, so "smartctl.exe" would have
+	/// meant "whatever is in System32".
+	/// </summary>
+	/// <remarks>
+	/// One rule for the sensor that starts the tool and for the install check that vets it: the
+	/// check was handed the configured text as written, so a relative path was looked up under the
+	/// working directory — another file, or none, than the one that gets started.
+	/// </remarks>
+	internal static string PathOf(string configured) =>
+		string.IsNullOrWhiteSpace(configured)
 			? Path.Combine(AppContext.BaseDirectory, "smartctl.exe")
 			: Path.IsPathFullyQualified(configured)
 				? configured
 				: Path.Combine(AppContext.BaseDirectory, configured);
-		_scanArgs = tools?.SmartctlScan ?? "--scan-open -d csmi";
-	}
 
 	/// <summary>
 	/// Every distinct disk behind the controller. Blocking, roughly 100 ms per device —

@@ -481,7 +481,9 @@ anyone but administrators — **and when the permissions could not be read at al
 that silently did not run must not look like one that passed. The folder's owner (who can grant
 themselves anything, holding no explicit permission) is reported in the diagnostics window but
 does not block anything: on a normally installed machine that owner is the administrator who
-created the folder.
+created the folder. The same window lists the program's files owned by anyone but Administrators,
+SYSTEM or TrustedInstaller — what a move instead of a copy, or a manual change of owner, leaves
+behind. That too is a line to read, not a refusal.
 
 Running the assembly through the runtime (`dotnet out\TrayMon.dll`) is a way to see the
 unelevated behaviour, not an installation: `Environment.ProcessPath` is then dotnet.exe. With no

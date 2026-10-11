@@ -249,6 +249,8 @@ public static class MemorySensor
 			// No value is what "this source is not answering" means, and the slot must go grey.
 			// Leaving the previous numbers in place kept the icon alive and coloured on data
 			// nobody had measured — the one failure mode this program is written to avoid.
+			// These two are enough: the gigabyte fields are only ever read behind them — ShowCore
+			// records no value without MemLoad, and Show() leaves a slot Fade() owns alone.
 			r.MemLoad = null;
 			r.CommitUsedGb = null;
 			return;

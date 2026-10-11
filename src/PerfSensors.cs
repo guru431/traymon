@@ -64,6 +64,9 @@ public sealed unsafe class PdhQuery : IDisposable
 	{
 		if (counter == IntPtr.Zero) return null;
 		if (PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, out _, out var v) != 0) return null;
+		// The status is part of the answer, as it is for every element in ReadArray: PDH documents
+		// the number as meaningful only under these two, and this one is the CPU icon.
+		if (v.CStatus != PDH_CSTATUS_VALID_DATA && v.CStatus != PDH_CSTATUS_NEW_DATA) return null;
 		return v.DoubleValue;
 	}
 
