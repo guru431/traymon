@@ -166,7 +166,9 @@ internal static class Program
 				$"{(d.SparePercent.HasValue ? "   spare " + d.SparePercent.Value.ToString("0", ci) + "%" : "")}");
 		if (r.Disks.Count == 0)
 			Say("disk     no temperatures (no drive answered the storage query, or disks hidden behind RAID)");
-		if (r.RaidDisks.Count == 0)
+		if (hdd.AsleepUnseen > 0)
+			Say($"raid     {hdd.AsleepUnseen} device(s) asleep, left so; no name before the first answer awake");
+		else if (r.RaidDisks.Count == 0)
 			Say("raid     no answer over CSMI (smartctl.exe missing, or no RAID controller here)");
 		foreach (var d in r.RaidDisks)
 			Say($"raid     {(d.Temp.HasValue ? d.Temp.Value.ToString("0", ci) : " —")} °C     {d.Name} <serial>   " +
@@ -289,7 +291,7 @@ internal static class Program
 		// The driver first: the library is then asked only about what the driver could not answer
 		// and about NVMe wear, instead of SMART-reading every drive to throw most of it away.
 		var fromDriver = disk.Read();
-		lhm.RefreshDiskTemps(name => fromDriver.Any(d => Similar(d.Name, name)));
+		lhm.RefreshDiskTemps(name => fromDriver.Count(d => Similar(d.Name, name)));
 		var fromLibrary = lhm.DiskTemps();
 		return Merge(fromDriver, fromLibrary);
 	}
@@ -318,6 +320,12 @@ internal static class Program
 
 		foreach (var d in fromDriver)
 		{
+			// The library sees more drives of this model than the driver answered for: one of them is
+			// a drive the driver could not read, and which one cannot be told — the library gives no
+			// serial. Its list of the model is then the whole of it, and the driver's a part. Keeping
+			// the driver's reading instead kept every library one out, the unread twin with them.
+			if (fromLibrary.Count(l => Similar(l.Name, d.Name)) > fromDriver.Count(o => Similar(o.Name, d.Name)))
+				continue;
 			var hit = -1;
 			var ambiguous = false;
 			for (var i = 0; i < fromLibrary.Count; i++)
@@ -337,11 +345,14 @@ internal static class Program
 
 		// Whatever only the library saw. One drive answering the storage query used to make every
 		// disk that only the library knows about disappear from the list altogether — and with it
-		// its icon, which had been there a minute earlier.
+		// its icon, which had been there a minute earlier. Checked against the driver's readings
+		// only: against the whole list, the first of two identical library-only drives kept the
+		// second one out.
+		var fromDriverKept = merged.Count;
 		for (var i = 0; i < fromLibrary.Count; i++)
 		{
 			if (used[i]) continue;
-			if (merged.Any(m => Similar(m.Name, fromLibrary[i].Name))) continue;
+			if (merged.Take(fromDriverKept).Any(m => Similar(m.Name, fromLibrary[i].Name))) continue;
 			merged.Add(fromLibrary[i]);
 		}
 		return merged;
@@ -2434,11 +2445,15 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		if (unit is not null) slot.LastUnit = unit;
 		if (!value.HasValue) return;
 
-		var at = stamp == 0 ? Environment.TickCount64 : stamp;
+		var now = Environment.TickCount64;
+		var at = stamp == 0 ? now : stamp;
 		slot.LastValue = value;
-		slot.MeasuredAt = DateTime.Now;
 		if (at == slot.StatsStamp) return;
 		slot.StatsStamp = at;
+		// From the stamp, and only for a new measurement: a cached UPS or RAID reading re-offered on
+		// every tick used to carry the time of the tick, so measured_at in the CSV and the time in
+		// «Сводка…» said "just now" about a number up to ten minutes old.
+		slot.MeasuredAt = DateTime.Now.AddMilliseconds(at - now);
 		slot.Stats.Add(value.Value, at);
 	}
 
@@ -2918,7 +2933,9 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			_r.RaidDisks = _hdd.ReadAll();
 			Volatile.Write(ref _r.RaidAt, Environment.TickCount64);
 			Interlocked.Increment(ref _raidVersion);
-			Backoff(ref _raidFailures, ref _raidRetryAt, _r.RaidDisks.Count > 0);
+			// A disk asleep since the start has no name yet, but it did answer: backing off would
+			// only delay the first poll that finds it awake.
+			Backoff(ref _raidFailures, ref _raidRetryAt, _r.RaidDisks.Count > 0 || _hdd.AsleepUnseen > 0);
 		}
 		catch (Exception ex)
 		{
@@ -3883,6 +3900,9 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		text.AppendLine($"smartctl:         {(_hdd.Available ? _hdd.ExePath : "не найден: " + _hdd.ExePath)}");
 		if (_hdd.LastError is not null) text.AppendLine($"                  {_hdd.LastError}");
 		if (_hdd.Note is not null) text.AppendLine($"                  {_hdd.Note}");
+		if (_hdd.AsleepUnseen > 0)
+			text.AppendLine($"                  спят с запуска, ещё не опознаны: {_hdd.AsleepUnseen} — " +
+							"значок появится, когда диск проснётся");
 		text.AppendLine($"ИБП:              {(_ups.Present ? "отвечает" : "нет ответа")} на {_ups.Endpoint}" +
 						$"{(_ups.LastError is null ? "" : " — " + _ups.LastError)}");
 		text.AppendLine();

@@ -51,6 +51,14 @@ public sealed class HddSensor
 	/// <summary>Why the last run failed, if it did; shown by the diagnostics window.</summary>
 	public string LastError { get; private set; }
 
+	/// <summary>
+	/// Devices that answered "asleep" in the last run without ever having been seen awake, so there
+	/// is no name to show them under — a disk already parked when TrayMon started has no icon until
+	/// it wakes. Counted so that a missing icon reads as "asleep", not as "not answering". Devices,
+	/// not disks: one disk answering on two ports is two here, as nothing tells them apart.
+	/// </summary>
+	public int AsleepUnseen { get; private set; }
+
 	public string ExePath => _exe;
 
 	public bool Available => File.Exists(_exe);
@@ -91,6 +99,7 @@ public sealed class HddSensor
 		if (!Available)
 		{
 			LastError = "smartctl.exe не найден: " + _exe;
+			AsleepUnseen = 0;
 			return disks;
 		}
 
@@ -106,6 +115,7 @@ public sealed class HddSensor
 		}
 		var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 		var asleep = 0;
+		var unseen = 0;
 
 		foreach (var (device, type) in _devices)
 		{
@@ -125,7 +135,8 @@ public sealed class HddSensor
 			if (Sleeping(root))
 			{
 				asleep++;
-				if (!_lastAwake.TryGetValue(device, out var last) || !seen.Add(Key(last.Serial, device))) continue;
+				if (!_lastAwake.TryGetValue(device, out var last)) { unseen++; continue; }
+				if (!seen.Add(Key(last.Serial, device))) continue;
 				disks.Add(last with { Temp = null, Asleep = true });
 				continue;
 			}
@@ -151,6 +162,7 @@ public sealed class HddSensor
 		// that answered "asleep" did answer — rescanning for it would only cost another run.
 		if (disks.Count == 0 && asleep == 0) _devices = null;
 		else LastError = null;
+		AsleepUnseen = unseen;
 		return disks;
 	}
 

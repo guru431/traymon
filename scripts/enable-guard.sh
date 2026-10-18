@@ -72,12 +72,20 @@ fi
 # right after seeding it — the hooks print WARN on every commit and skip the personal-data check,
 # while this script ended on "Done". Looked up the way the hooks look it up (main checkout, then
 # the user-level copy), through the same function, not as ./.sanitize-patterns.
-. .githooks/_scan.sh
-denylist=$(scan_denylist_path)
-if [ ! -f "$denylist" ]; then
-    echo "[warn] no denylist at $denylist — the personal-data check is SKIPPED on every commit"
-    echo "       (the generic secret-format check does run). Create it, then re-run."
+# Checked before sourcing: under `set -e` a missing file ended the script right here, with a bare
+# shell error instead of the "NOT done" below — and every hook sources it, so none of them can run.
+if [ ! -f .githooks/_scan.sh ]; then
+    echo "[warn] .githooks/_scan.sh is missing — every hook sources it, so none of them can run."
+    echo "       Restore it (git checkout -- .githooks/_scan.sh), then re-run."
     rc=1
+else
+    . .githooks/_scan.sh
+    denylist=$(scan_denylist_path)
+    if [ ! -f "$denylist" ]; then
+        echo "[warn] no denylist at $denylist — the personal-data check is SKIPPED on every commit"
+        echo "       (the generic secret-format check does run). Create it, then re-run."
+        rc=1
+    fi
 fi
 
 echo ""

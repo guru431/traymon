@@ -978,16 +978,16 @@ public sealed class LhmSensor : IDisposable
 	/// rarely. A disk running out of spare blocks matters more than a warm one, which is the
 	/// same argument that already put the SMART verdict on the RAID icons.
 	/// </summary>
-	/// <param name="answered">Whether the storage driver has already given this drive's
-	/// temperature. Such a drive is asked here only for its wear figures — an NVMe log page — and
-	/// a drive without them is not asked at all.</param>
+	/// <param name="answered">How many drives of this model the storage driver has already given a
+	/// temperature for. When that covers every such drive the library has, they are asked here only
+	/// for their wear figures — an NVMe log page — and a drive without them is not asked at all.</param>
 	/// <remarks>
 	/// Every drive used to get a SMART read every 62 seconds, and for a SATA disk the driver had
 	/// answered, all of it was thrown away: the merge takes only wear and spare from here, and SATA
 	/// has neither. A SMART command is also what spins a parked hard disk up — the reason smartctl
 	/// has <c>-n standby</c> — so a disk that was meant to sleep after twenty idle minutes never did.
 	/// </remarks>
-	public void RefreshDiskTemps(Func<string, bool> answered = null)
+	public void RefreshDiskTemps(Func<string, int> answered = null)
 	{
 		if (!Available) return;
 		var fresh = new List<DiskReading>();
@@ -996,13 +996,19 @@ public sealed class LhmSensor : IDisposable
 			if (_closed) return;
 			try
 			{
-				foreach (var hw in _computer.Hardware.Where(h => h.HardwareType == HardwareType.Storage))
+				var storage = _computer.Hardware.Where(h => h.HardwareType == HardwareType.Storage).ToList();
+				foreach (var hw in storage)
 				{
 					// The wear sensors exist from the moment the library opens the drive (NVMe
 					// creates them in its constructor), so this is known before anything is read.
 					var wears = hw.Sensors.Any(s => s.SensorType == SensorType.Level &&
 													(s.Name == "Percentage Used" || s.Name == "Available Spare"));
-					if (!wears && answered is not null && answered(hw.Name)) continue;
+					// By count, not by model alone: of two identical disks with one answered by the
+					// driver, the other was skipped too and vanished. Which of the pair is the
+					// unanswered one cannot be told without a serial, so both are read then.
+					if (!wears && answered is not null &&
+						answered(hw.Name) >= storage.Count(h => string.Equals(h.Name, hw.Name, StringComparison.OrdinalIgnoreCase)))
+						continue;
 					hw.Update();
 					var t = hw.Sensors.FirstOrDefault(s => s.SensorType == SensorType.Temperature && s.Name == "Temperature");
 					if (t?.Value is null) continue;

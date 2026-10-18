@@ -609,8 +609,18 @@ public sealed class Config : IGuidStore
 				stream.Write(bytes, 0, bytes.Length);
 				stream.Flush(flushToDisk: true);
 			}
-			if (File.Exists(Path)) File.Replace(temp, Path, null);
-			else File.Move(temp, Path);
+			if (!File.Exists(Path)) File.Move(temp, Path);
+			else
+			{
+				// Replace first: it keeps what the old file carried, its ACL and owner among them.
+				// But it can fail half way — ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 leaves the old file
+				// renamed and nothing under this name — and a redirector need not do what it asks.
+				// The catch below then deleted the only complete copy of the new settings. A plain
+				// replacing rename puts them in place in either case; where the file is locked it
+				// fails too, and that is reported.
+				try { File.Replace(temp, Path, null); }
+				catch (IOException) { File.Move(temp, Path, overwrite: true); }
+			}
 			Stamp = File.GetLastWriteTimeUtc(Path);
 			return true;
 		}

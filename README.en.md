@@ -406,7 +406,9 @@ than its human-readable table: Samsung and some Intel SATA SSDs report temperatu
 `FAILING_NOW` broke the pattern exactly as the disk started to fail. Sleeping drives are not
 woken (`-n standby,0`), and do not lose their icon: smartctl stops at the power check before
 reading even the model, so a sleeping disk is shown alive, with the name and health of its last
-answer and a tooltip saying it is asleep. Devices are deduplicated by serial number and the device list is
+answer and a tooltip saying it is asleep. A disk already asleep when TrayMon started has no name
+to show yet: its icon appears once it wakes, and until then "Диагностика…" and `--once` say how
+many devices are asleep unidentified. Devices are deduplicated by serial number and the device list is
 rediscovered hourly and on "poll now" — one healthy old disk used to hold the old list for ever.
 The same query brings back the SMART health verdict: a failing disk matters more than a warm one,
 so a disk **with no temperature but a bad verdict** gets an icon too. It used to be dropped from

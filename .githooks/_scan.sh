@@ -81,7 +81,9 @@ scan_text() {
     echo "WARN: .sanitize-patterns not found (looked in $scan_sp) — the personal-data check is SKIPPED."
   fi
   if [ -f "$scan_sp" ]; then
-    scan_pat=$(mktemp 2>/dev/null || echo "$scan_sp.tmp")
+    # The fallback is per process: under one fixed name two hooks running at once — two worktrees
+    # of one repository — read each other's half-written pattern list.
+    scan_pat=$(mktemp 2>/dev/null || echo "$scan_sp.$$.tmp")
     scan_rc=0
     scan_denylist_patterns "$scan_sp" > "$scan_pat" || scan_rc=$?
     if [ "$scan_rc" -ne 0 ]; then

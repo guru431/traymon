@@ -614,6 +614,32 @@ public sealed class DiskMergeTests
 		Assert.Contains(merged, d => d.Name == "Intel SSDPEKNW010T8" && d.WearPercent == 12);
 	}
 
+	/// <summary>
+	/// Two identical drives, only one of which answered the storage query. The library saw both,
+	/// the match was ambiguous, and the model the driver had answered for then kept both library
+	/// readings out — the hot twin included. Which library reading is the driver's drive cannot be
+	/// told, so the library's pair is the list.
+	/// </summary>
+	[Fact]
+	public void ATwinTheDriverCouldNotReadIsNotLost()
+	{
+		var merged = Program.Merge(
+			new List<DiskReading> { Driver("NVMe WDC SN770 1TB", 40) },
+			new List<DiskReading> { Library("WDC SN770 1TB", 40, 3), Library("WDC SN770 1TB", 70, 5) });
+		Assert.Equal(2, merged.Count);
+		Assert.Contains(merged, d => d.Temp == 70 && d.WearPercent == 5);
+		Assert.Contains(merged, d => d.Temp == 40 && d.WearPercent == 3);
+	}
+
+	[Fact]
+	public void IdenticalLibraryOnlyDisksAreBothKept()
+	{
+		var merged = Program.Merge(
+			new List<DiskReading> { Driver("Samsung SSD 990 PRO 2TB", 47) },
+			new List<DiskReading> { Library("Intel SSDPEKNW010T8", 55, 12), Library("Intel SSDPEKNW010T8", 58, 20) });
+		Assert.Equal(3, merged.Count);
+	}
+
 	[Fact]
 	public void WithNoDriverAnswerTheLibraryListIsUsedAsIs()
 	{
