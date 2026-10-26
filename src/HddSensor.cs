@@ -66,7 +66,7 @@ public sealed class HddSensor
 	public HddSensor(ToolSettings tools = null)
 	{
 		_exe = PathOf(tools?.Smartctl);
-		_scanArgs = tools?.SmartctlScan ?? "--scan-open -d csmi";
+		_scanArgs = tools?.SmartctlScan ?? ToolSettings.DefaultScan;
 	}
 
 	/// <summary>
@@ -113,7 +113,7 @@ public sealed class HddSensor
 			_devices = Discover();
 			_discoveredAt = Environment.TickCount64;
 		}
-		var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		var answers = new List<(string Key, RaidDisk Disk)>();
 		var asleep = 0;
 		var unseen = 0;
 
@@ -136,8 +136,7 @@ public sealed class HddSensor
 			{
 				asleep++;
 				if (!_lastAwake.TryGetValue(device, out var last)) { unseen++; continue; }
-				if (!seen.Add(Key(last.Serial, device))) continue;
-				disks.Add(last with { Temp = null, Asleep = true });
+				answers.Add((Key(last.Serial, device), last with { Temp = null, Asleep = true }));
 				continue;
 			}
 
@@ -150,13 +149,12 @@ public sealed class HddSensor
 			if (temp is null && health.Length == 0) continue;
 
 			var serial = Text(root, "serial_number") ?? "";
-			if (!seen.Add(Key(serial, device))) continue;   // same disk answering on another port
-
 			var name = Text(root, "model_name") ?? Text(root, "device_model") ?? "RAID disk";
 			var disk = new RaidDisk(name.Trim(), temp, serial, health);
 			_lastAwake[device] = disk;
-			disks.Add(disk);
+			answers.Add((Key(serial, device), disk));
 		}
+		disks = Distinct(answers);
 
 		// Nothing answered: the controller or the disks changed, so look again next time. A disk
 		// that answered "asleep" did answer — rescanning for it would only cost another run.
@@ -167,6 +165,22 @@ public sealed class HddSensor
 	}
 
 	private static string Key(string serial, string device) => string.IsNullOrEmpty(serial) ? device : serial;
+
+	/// <summary>
+	/// One entry per disk, in port order: the same disk answering on another port is dropped, and a
+	/// live answer beats the copy of a sleeping one whichever port was asked first. First-come used to
+	/// decide that too, so a disk that woke between two queries showed "asleep" and no temperature
+	/// while its fresh reading on the second port was thrown away as the duplicate.
+	/// </summary>
+	internal static List<RaidDisk> Distinct(List<(string Key, RaidDisk Disk)> answers)
+	{
+		var awake = answers.Where(a => !a.Disk.Asleep).Select(a => a.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+		var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		var disks = new List<RaidDisk>();
+		foreach (var (key, disk) in answers)
+			if ((!disk.Asleep || !awake.Contains(key)) && seen.Add(key)) disks.Add(disk);
+		return disks;
+	}
 
 	/// <summary>
 	/// Whether smartctl stopped at the power check. Newer versions say so in <c>power_mode</c>,

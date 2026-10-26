@@ -382,9 +382,14 @@ internal static class Autostart
 
 		try
 		{
+			// Deleted only when it is proven ours. An unreadable target or an unknown own path used to
+			// fall through to the delete — the very case the "not proof" rule below is about.
 			if (!File.Exists(ShortcutPath)) report.Add("Ярлыка на рабочем столе не было");
-			else if (ShortcutTarget(ShortcutPath) is { } target && ExePath is not null &&
-					 !string.Equals(target, ExePath, StringComparison.OrdinalIgnoreCase))
+			else if (ShortcutTarget(ShortcutPath) is not { } target)
+				report.Add("Ярлык на рабочем столе оставлен: не удалось прочитать, куда он указывает");
+			else if (ExePath is null)
+				report.Add($"Ярлык на рабочем столе оставлен: путь к TrayMon.exe неизвестен, сверить не с чем ({target})");
+			else if (!string.Equals(target, ExePath, StringComparison.OrdinalIgnoreCase))
 				report.Add($"Ярлык на рабочем столе оставлен: он указывает на {target}");
 			else { File.Delete(ShortcutPath); report.Add("Ярлык на рабочем столе удалён"); }
 		}

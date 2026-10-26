@@ -3767,7 +3767,11 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// shell that is merely busy refuses every add and retries on its own: asking about
 		// registration here would switch extra icons on and raise a dialog every two seconds
 		// during a logon, which is the failure mode the whole program avoids elsewhere.
-		if (_order.Any(s => s.Settings.Enabled)) return;
+		if (_order.Any(s => s.Settings.Enabled))
+		{
+			_ensuredVisible = false;   // this occurrence is over; the next one is told again
+			return;
+		}
 
 		// An edit on disk is taken in before the change below, not after it: adopting the file
 		// later would drop the change, and saving without it would drop the edit. Only down here,

@@ -672,3 +672,34 @@ public sealed class SmartctlPathTests
 		Assert.Equal(@"C:\Program Files\smartmontools\bin\smartctl.exe",
 					 HddSensor.PathOf(@"C:\Program Files\smartmontools\bin\smartctl.exe"));
 }
+
+/// <summary>
+/// Some CSMI drivers answer with one disk on several ports. Which answer is kept used to depend on
+/// which port was asked first, and a copy of the disk asleep beat a fresh reading of it awake.
+/// </summary>
+public sealed class RaidDedupTests
+{
+	private static readonly RaidDisk Awake = new("WDC WD40EFRX", 34, "WD-1", "PASSED");
+	private static readonly RaidDisk Asleep = Awake with { Temp = null, Asleep = true };
+
+	[Fact]
+	public void ALiveAnswerBeatsTheSleepingCopyOnAnEarlierPort()
+	{
+		var disks = HddSensor.Distinct(new() { ("WD-1", Asleep), ("WD-1", Awake) });
+		Assert.Equal(new[] { Awake }, disks);
+	}
+
+	[Fact]
+	public void OneDiskOnTwoPortsIsKeptOnce()
+	{
+		Assert.Equal(new[] { Awake }, HddSensor.Distinct(new() { ("WD-1", Awake), ("WD-1", Awake with { Temp = 35 }) }));
+		Assert.Equal(new[] { Asleep }, HddSensor.Distinct(new() { ("WD-1", Asleep), ("WD-1", Asleep) }));
+	}
+
+	[Fact]
+	public void DifferentDisksStayInPortOrder()
+	{
+		var other = new RaidDisk("ST4000VN008", null, "ZD-2", "PASSED") { Asleep = true };
+		Assert.Equal(new[] { other, Awake }, HddSensor.Distinct(new() { ("ZD-2", other), ("WD-1", Awake) }));
+	}
+}

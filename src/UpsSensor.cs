@@ -86,7 +86,9 @@ public sealed class UpsSensor
 		_host = settings.Host;
 		_port = settings.Port;
 		_timeoutMs = settings.TimeoutMs;
-		_community = Encoding.ASCII.GetBytes(settings.Community);
+		// UTF-8, not ASCII: a community is an octet string, and ASCII turned every other character
+		// into '?' — the agent then refused it, and nothing said the encoding was to blame.
+		_community = Encoding.UTF8.GetBytes(settings.Community);
 	}
 
 	/// <summary>

@@ -178,16 +178,23 @@ public sealed class NetSettings
 	[JsonIgnore]
 	public string[] Included => _include is { Count: > 0 } ? _include.ToArray() : Array.Empty<string>();
 
-	/// <summary>The configured link speed for this adapter description, or null.</summary>
+	/// <summary>The configured link speed for this adapter description, or null. Of several
+	/// matching substrings the longest wins. The first one found used to: that is file order only
+	/// as long as a Dictionary happens to enumerate in insertion order, which it does not promise,
+	/// and "Ethernet" written above "Ethernet 3" took the adapter the second line was for.</summary>
 	public double? BandwidthFor(string adapter)
 	{
 		if (Bandwidth is null || string.IsNullOrEmpty(adapter)) return null;
+		double? best = null;
+		var bestLength = 0;
 		foreach (var (pattern, mbit) in Bandwidth)
 		{
-			if (string.IsNullOrWhiteSpace(pattern) || !(mbit > 0)) continue;
-			if (adapter.Contains(pattern, StringComparison.OrdinalIgnoreCase)) return mbit;
+			if (string.IsNullOrWhiteSpace(pattern) || !(mbit > 0) || pattern.Length <= bestLength) continue;
+			if (!adapter.Contains(pattern, StringComparison.OrdinalIgnoreCase)) continue;
+			best = mbit;
+			bestLength = pattern.Length;
 		}
-		return null;
+		return best;
 	}
 }
 
@@ -215,7 +222,9 @@ public sealed class ToolSettings
 	/// that directory is %SystemRoot%\System32, and this process holds an elevated token.</summary>
 	public string Smartctl { get; set; }
 
-	private string _smartctlScan = "--scan-open -d csmi";
+	internal const string DefaultScan = "--scan-open -d csmi";
+
+	private string _smartctlScan = DefaultScan;
 
 	/// <summary>
 	/// How to enumerate the disks behind the controller. CSMI covers Intel RST, which is what
@@ -227,6 +236,37 @@ public sealed class ToolSettings
 		get => _smartctlScan;
 		set { if (!string.IsNullOrWhiteSpace(value)) _smartctlScan = value; }
 	}
+
+	/// <summary>
+	/// Whether <see cref="SmartctlScan"/> is a scan and nothing else: <c>--scan</c> or
+	/// <c>--scan-open</c>, with <c>-d TYPE</c> or <c>--device=TYPE</c>.
+	/// </summary>
+	/// <remarks>
+	/// The text goes onto the command line of a process started with our token, after a path that
+	/// is vetted for where it lives, not for what it is: <c>Tools.Smartctl</c> naming cmd.exe in
+	/// System32 passes that check, and then this setting is the payload. The device names and types
+	/// that come back from the scan were already refused when they could split the command line;
+	/// what the user typed was not checked at all.
+	/// </remarks>
+	internal static bool ScanAllowed(string args)
+	{
+		var tokens = args.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+		var scan = false;
+		for (var i = 0; i < tokens.Length; i++)
+		{
+			var token = tokens[i];
+			if (token is "--scan" or "--scan-open") scan = true;
+			else if (token == "-d" && i + 1 < tokens.Length && DeviceType(tokens[i + 1])) i++;
+			else if (!(token.StartsWith("--device=", StringComparison.Ordinal) && DeviceType(token["--device=".Length..])))
+				return false;
+		}
+		return scan;
+	}
+
+	/// <summary>"csmi", "megaraid,0", "aacraid,0,0,1", "sat+megaraid,2", "areca,1/2".</summary>
+	private static bool DeviceType(string value) =>
+		value.Length > 0 && char.IsAsciiLetterOrDigit(value[0]) &&
+		value.All(c => char.IsAsciiLetterOrDigit(c) || c is ',' or '+' or '/' or '.' or '_' or '-');
 }
 
 /// <summary>
@@ -505,6 +545,12 @@ public sealed class Config : IGuidStore
 				s.WarnGb = null;
 				s.CritGb = null;
 			}
+		}
+
+		if (Tools is not null && !ToolSettings.ScanAllowed(Tools.SmartctlScan))
+		{
+			_skipped.Add("Tools.SmartctlScan");
+			Tools.SmartctlScan = ToolSettings.DefaultScan;
 		}
 	}
 

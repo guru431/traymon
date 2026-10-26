@@ -73,7 +73,15 @@ Write-Host "Запуск: dotnet $Dll --once"
 # исключение — обрывала скрипт вместо сверки. В pwsh 7 так не бывает, отсюда разное поведение.
 $ErrorActionPreference = "Continue"
 $output = & dotnet $Dll --once 2>&1 | ForEach-Object { "$_" }
+$onceExit = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
+# Упавшая сборка печатает трассу стека, а не отчёт, и сверка выдала бы её строки за подписи,
+# которых нет в README, — вместо того чтобы сказать, что сверять нечего.
+if ($onceExit -ne 0) {
+    Write-Host "`n--once вернул код ${onceExit}: сборка упала, сверять нечего. Конец вывода:" -ForegroundColor Yellow
+    $output | Select-Object -Last 15 | ForEach-Object { Write-Host "  $_" }
+    exit 1
+}
 
 # Пример в README — первый блок ``` после строки с --once
 $readmeLines = Get-Content $Readme

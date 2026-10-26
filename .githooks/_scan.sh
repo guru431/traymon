@@ -26,10 +26,15 @@ scan_generic_pattern() {
 # skipped, while `scan_text` looked in the right place. Two resolvers, two
 # answers, and the difference decided whether a secret was published.
 # Prints the path (which may not exist) on stdout.
+# Made absolute with cd, not with --path-format=absolute: that is Git 2.31+,
+# and an older rev-parse echoes an option it does not know back as output
+# instead of failing — a non-empty answer pointing nowhere, the worktree bug
+# again. --git-common-dir alone is Git 2.5+; on anything older its echo is not
+# a directory, and the top level is the best there is.
 scan_denylist_path() {
-  scan_common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
-  if [ -n "$scan_common" ]; then
-    scan_sp="$(dirname "$scan_common")/.sanitize-patterns"
+  scan_common=$(git rev-parse --git-common-dir 2>/dev/null || true)
+  if [ -n "$scan_common" ] && [ -d "$scan_common" ]; then
+    scan_sp="$(dirname "$(cd "$scan_common" && pwd)")/.sanitize-patterns"
   else
     scan_sp="$(git rev-parse --show-toplevel)/.sanitize-patterns"
   fi

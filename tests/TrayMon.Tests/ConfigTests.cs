@@ -468,4 +468,49 @@ public sealed class ConfigTests : IDisposable
 		Assert.Equal(1200, config.Net.BandwidthFor("Intel Wi-Fi 6E AX211"));
 		Assert.Null(config.Net.BandwidthFor("Realtek 2.5GbE"));
 	}
+
+	/// <summary>Of two matching substrings the longer one is meant, whichever comes first.</summary>
+	[Theory]
+	[InlineData("""{ "Ethernet": 100, "Ethernet 3": 1000 }""")]
+	[InlineData("""{ "Ethernet 3": 1000, "Ethernet": 100 }""")]
+	public void TheLongestBandwidthPatternWins(string bandwidth)
+	{
+		File.WriteAllText(Config.Path, $$"""{ "Net": { "Bandwidth": {{bandwidth}} } }""");
+		var config = Config.Load();
+		Assert.Equal(1000, config.Net.BandwidthFor("Ethernet 3"));
+		Assert.Equal(100, config.Net.BandwidthFor("Ethernet 2"));
+	}
+
+	/// <summary>
+	/// The scan setting goes onto the command line of a process started with an administrator token,
+	/// after a path vetted only for where it lives. Anything but a scan is dropped, with a note.
+	/// </summary>
+	[Theory]
+	[InlineData("--scan-open -d csmi /c calc")]
+	[InlineData("--scan-open -d csmi --drivedb=C:\\Users\\Public\\x.h")]
+	[InlineData("-d csmi")]
+	[InlineData("--scan -d \"csmi\"")]
+	[InlineData("--scan -d -x")]
+	public void ASmartctlScanThatIsNotAScanIsDropped(string scan)
+	{
+		File.WriteAllText(Config.Path, System.Text.Json.JsonSerializer.Serialize(new { Tools = new { SmartctlScan = scan } }));
+		var config = Config.Load();
+		Assert.Null(config.LoadError);
+		Assert.Contains("Tools.SmartctlScan", config.LoadNote);
+		Assert.Equal("--scan-open -d csmi", config.Tools.SmartctlScan);
+	}
+
+	[Theory]
+	[InlineData("--scan-open -d csmi")]
+	[InlineData("--scan-open -d megaraid,0")]
+	[InlineData("--scan -d aacraid,0,0,1")]
+	[InlineData("--scan-open --device=sat+megaraid,2")]
+	[InlineData("--scan-open -d areca,1/2")]
+	public void ARealScanIsKept(string scan)
+	{
+		File.WriteAllText(Config.Path, System.Text.Json.JsonSerializer.Serialize(new { Tools = new { SmartctlScan = scan } }));
+		var config = Config.Load();
+		Assert.Null(config.LoadNote);
+		Assert.Equal(scan, config.Tools.SmartctlScan);
+	}
 }

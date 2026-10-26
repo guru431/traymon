@@ -194,6 +194,9 @@
   `TrayMon.json` лежит в более слабом месте; иначе запуск и запись в `HddSensor.Note`. То же
   правило у CSV-журнала по `Log.Path` (`LogRefused`). `WritableByNonAdmins`/`UnsafeToRun`
   проверяют и окончательный путь (junction, symlink); неразрешённый путь — как непрочитанный ACL.
+- `Tools.SmartctlScan` — только сканирование (`ToolSettings.ScanAllowed`, отбраковка в
+  `Config.Validate`): путь к инструменту судится по месту, а не по сути, и аргументы не должны
+  стать нагрузкой для `cmd.exe` из System32.
 - Драйвер WinRing0 (CVE-2020-14979) — принятый риск, записан в обеих README: после `Open()` проба
   чтения, при неудаче `DriverBlocked`; DACL `\\.\WinRing0_1_2_0` сужается до Administrators/SYSTEM.
   Переход на LHM ≥ 0.9.5 с PawnIO — новое требование установки (обе README) и замер `ReadSlow`.

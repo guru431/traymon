@@ -275,8 +275,8 @@ somebody had deliberately silenced.
 - `Net.NotPhysical` — **a custom list replaces the built-in one entirely**, which is why it is
   spelled out in full above. `Net.Include` is the way to keep a VPN or a virtual adapter you do
   watch without rewriting that list; `Net.Bandwidth` gives the percentage a figure to divide by
-  where the driver leaves `Current Bandwidth` empty or where a Wi-Fi link rate is not a capacity.
-  With no link speed the utilisation is not invented: there is no threshold colour and the tooltip
+  where the driver leaves `Current Bandwidth` empty or where a Wi-Fi link rate is not a capacity;
+  of several substrings matching one adapter, the longest wins. With no link speed the utilisation is not invented: there is no threshold colour and the tooltip
   says the link speed is unknown. A configured bandwidth does not stand in for the link itself: a
   Wi-Fi out of range or an unplugged cable still greys the icon out with "no link".
 - `Tools.Smartctl` — a relative path is resolved against the program folder, never against the
@@ -286,6 +286,10 @@ somebody had deliberately silenced.
   non-administrator, smartctl runs as usual and the diagnostics window says so: TrayMon.exe and
   its DLLs sitting beside it can be replaced just as easily, so blocking one tool would change
   nothing about the risk while silently costing the RAID temperatures.
+- `Tools.SmartctlScan` — a scan and nothing else: `--scan` or `--scan-open` with `-d TYPE`
+  (`-d megaraid,N`, `-d aacraid,...` for LSI and Adaptec). It goes onto the command line of an
+  elevated process, so anything else is dropped — CSMI applies, with a note in «Диагностика…»
+  and `--once`.
 - `Sensors.UseSensorDriver` — `false` keeps LibreHardwareMonitor, and the WinRing0 driver it
   loads, unopened. CPU temperature, motherboard fans and NVMe wear then have no source and say so.
 - `Log` — `time;id;value;unit;severity;status;measured_at`, one row per icon. The raw number in a
@@ -558,7 +562,7 @@ two buttons named after the action. (It used to be Yes / No / Cancel, where "No"
 — it only meant "keep TrayMon.json".) Only our own things are removed: the scheduled task if it
 starts **this** copy, the desktop shortcut if it points at it, and the tray positions keyed by
 "path to exe + GUID". Anything belonging to another installation is left alone and the report says
-so. After that, delete the executable and its folder. Deleting the executable alone is not enough
+so; so is a shortcut whose target could not be read. After that, delete the executable and its folder. Deleting the executable alone is not enough
 — the task would remain, launching a file that no longer exists at every logon.
 
 The autostart checkbox reflects what the scheduler actually holds: the task must be enabled, carry
