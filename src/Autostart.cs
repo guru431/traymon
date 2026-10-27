@@ -578,7 +578,7 @@ internal static class Autostart
 											 uint disposition, uint flags, IntPtr template);
 
 	[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-	private static extern uint GetFinalPathNameByHandleW(IntPtr handle, char[] path, uint length, uint flags);
+	private static extern uint GetFinalPathNameByHandleW(IntPtr handle, [Out] char[] path, uint length, uint flags);
 
 	[DllImport("kernel32.dll")]
 	[return: MarshalAs(UnmanagedType.Bool)]

@@ -4,6 +4,19 @@
 не сделана. Файл существует ровно затем, чтобы одно и то же не подавалось заново —
 еженедельный `agents-md-sync-check` делает это каждую неделю. Отсюда ничего не удаляется.
 
+## 2026-10-27 · code-review: секция `Log` в `TrayApp` разыменовывается без `?.` [P3]
+**Context:** еженедельное автоматическое ревью кода, `src/Program.cs:WriteLogLine/FlushLog/Roll`,
+`if (_dry || !_config.Log.Enabled) return;`, category=inconsistency.
+**What:** заявлено, что без секции `Log` в `TrayMon.json` `WriteLogLine` падает с
+`NullReferenceException` на каждом тике: `Program.Secrets` пишет `config?.Log?.Path`, а `Tools` в
+`TrayApp` читается через `?.`. Предложено проверять `_config.Log` на null.
+**Status:** wontfix
+**Resolved:** 2026-10-27 — `_config.Log` не бывает null. `_config` берётся только из `Config.Load`/`Read`
+(после разбора там `config.Log ??= new LogSettings()`, как и для `Tools`, `Ups`, `Net`, `Sensors`) или
+из `new Config()` с инициализатором `= new()`; `Adopt` получает результат того же `Read`. Нет секции
+или в ней явный `"Log": null` — подставляются умолчания. `?.` в `Secrets` и `Tools?.` в `TrayApp` —
+лишняя осторожность, а не признак того, что секция может пропасть.
+
 ## 2026-10-24 · code-review: износ NVMe теряется, если библиотека не отдала температуру [P3]
 **Context:** еженедельное автоматическое ревью кода, `src/Sensors.cs:RefreshDiskTemps`,
 `if (t?.Value is null) continue;` до чтения `Percentage Used` / `Available Spare`, category=correctness.

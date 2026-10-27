@@ -836,7 +836,10 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private readonly Queue<string> _logQueue = new();
 	private int _logWriting;
 	private int _logDropped;
-	private bool _logHeaderChecked;
+
+	/// <summary>The trail whose header has been checked. A path, not a flag: a flag set for the first
+	/// file let a reload that pointed the log at an older CSV append under its foreign header.</summary>
+	private string _logHeaderPath;
 
 	/// <summary>Guards against re-entering the tick from a modal dialog's own message loop.</summary>
 	private bool _inTick;
@@ -2658,13 +2661,13 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		_lastTickError = "настройки не сохранены: " + error;
 	}
 
+	/// <summary>The CSV header, and the contract with whoever reads the file back.</summary>
+	private const string LogHeader = "time;id;value;unit;severity;status;measured_at";
+
 	/// <summary>
 	/// Optional CSV trail. Off by default and never faster than every 30 s — at tick rate this
 	/// would cost as much as the sensors it records.
 	/// </summary>
-	/// <summary>The CSV header, and the contract with whoever reads the file back.</summary>
-	private const string LogHeader = "time;id;value;unit;severity;status;measured_at";
-
 	private void WriteLogLine()
 	{
 		if (_dry || !_config.Log.Enabled) return;
@@ -2762,9 +2765,9 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 				}
 				Roll(path);
 				if (!File.Exists(path)) File.AppendAllText(path, LogHeader + "\n");
-				else if (!_logHeaderChecked)
+				else if (!string.Equals(path, _logHeaderPath, StringComparison.OrdinalIgnoreCase))
 				{
-					_logHeaderChecked = true;
+					_logHeaderPath = path;
 					// An older file has different columns. Appending to it would produce a table
 					// nothing can parse, so it is set aside once and a fresh one started.
 					using var reader = new StreamReader(path);

@@ -107,6 +107,9 @@ public sealed class HddSensor
 		// TrayMon holds an elevated one, the path comes out of a file the user can edit, and
 		// CreateProcess would happily start whatever is sitting there.
 		if (!Safe()) return disks;
+		// Only this run's failure explains this run's silence. Kept from an earlier one, "smartctl
+		// вернул не JSON" stayed in the tooltip after the controller was simply gone.
+		LastError = null;
 
 		if (_devices is null || Environment.TickCount64 - _discoveredAt > RediscoverAfterMs)
 		{
@@ -230,23 +233,28 @@ public sealed class HddSensor
 	/// silently costs the RAID temperatures, which is exactly what it did on a live machine.
 	/// Checked once: an ACL is not free and does not move.
 	/// </summary>
+	/// <remarks>
+	/// The verdict is cached only once both checks have returned. It used to be set to "safe" before
+	/// they ran, so a check that threw left it there, and every later run started the tool unchecked.
+	/// </remarks>
 	private bool Safe()
 	{
 		if (_safe.HasValue) return _safe.Value;
-		_safe = true;
 		var protectedFolder = !Autostart.WritableByNonAdmins(AppContext.BaseDirectory, out _);
-		if (!Autostart.UnsafeToRun(_exe, out var who)) return true;
-
-		if (protectedFolder)
+		if (Autostart.UnsafeToRun(_exe, out var who))
 		{
-			_safe = false;
-			LastError = "smartctl.exe не запущен: он вне защищённой папки программы, и его может " +
-						"подменить " + who + ", а TrayMon работает с правами администратора";
-			return false;
+			if (protectedFolder)
+			{
+				_safe = false;
+				LastError = "smartctl.exe не запущен: он вне защищённой папки программы, и его может " +
+							"подменить " + who + ", а TrayMon работает с правами администратора";
+				return false;
+			}
+			Note = "smartctl.exe запускается из папки, доступной на запись (" + who + "). " +
+				   "TrayMon работает с правами администратора, поэтому подменённый файл получил бы их же — " +
+				   "но то же верно и для самого TrayMon.exe рядом с ним";
 		}
-		Note = "smartctl.exe запускается из папки, доступной на запись (" + who + "). " +
-			   "TrayMon работает с правами администратора, поэтому подменённый файл получил бы их же — " +
-			   "но то же верно и для самого TrayMon.exe рядом с ним";
+		_safe = true;
 		return true;
 	}
 
