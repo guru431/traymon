@@ -67,6 +67,35 @@ function Get-Labels([string[]]$lines) {
     $labels | Sort-Object -Unique
 }
 
+function Get-CodeBlocks([string[]]$lines, [string]$source) {
+    $blocks = @()
+    $fence = $null
+    $current = @()
+    $lineNumber = 0
+    $openedAt = 0
+    foreach ($line in $lines) {
+        $lineNumber++
+        if (-not $fence) {
+            if ($line -match '^\s*(`{3,}|~{3,})(.*)$') {
+                $fence = $Matches[1]
+                $openedAt = $lineNumber
+                $current = @()
+            }
+            continue
+        }
+        # A shorter fence or a different character is content, including nested examples.
+        $closing = '^\s*' + [regex]::Escape($fence.Substring(0, 1)) + '{' + $fence.Length + ',}\s*$'
+        if ($line -match $closing) {
+            $blocks += , $current
+            $fence = $null
+        } else { $current += $line }
+    }
+    if ($fence) { throw "В $source незакрытый блок кода (строка $openedAt)." }
+    return , $blocks
+}
+
+$blocks = Get-CodeBlocks (Get-Content -Encoding UTF8 $Readme) $Readme
+
 Write-Host "Запуск: dotnet $Dll --once"
 # Windows PowerShell 5.1 превращает каждую строку stderr нативной команды под 2>&1 в
 # NativeCommandError, и при "Stop" первая же из них — сообщение хоста dotnet, необработанное
@@ -81,20 +110,6 @@ if ($onceExit -ne 0) {
     Write-Host "`n--once вернул код ${onceExit}: сборка упала, сверять нечего. Конец вывода:" -ForegroundColor Yellow
     $output | Select-Object -Last 15 | ForEach-Object { Write-Host "  $_" }
     exit 1
-}
-
-# Пример в README — первый блок ``` после строки с --once
-$readmeLines = Get-Content $Readme
-$blocks = @()
-$inBlock = $false
-$current = @()
-foreach ($line in $readmeLines) {
-    if ($line -match '^\s*```') {
-        if ($inBlock) { $blocks += , $current; $current = @() }
-        $inBlock = -not $inBlock
-        continue
-    }
-    if ($inBlock) { $current += $line }
 }
 
 $example = $blocks | Where-Object { ($_ -join "`n") -match '(?m)^counter in use:' } | Select-Object -First 1

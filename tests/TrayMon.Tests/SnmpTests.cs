@@ -86,6 +86,32 @@ public sealed class SnmpParserTests
 		Assert.Equal(0x42, reply.Vars[CapacityOid].Tag);
 	}
 
+	[Theory]
+	[InlineData(new byte[] { 0x27, 3 }, "0.39.3")]
+	[InlineData(new byte[] { 0x4F, 3 }, "1.39.3")]
+	[InlineData(new byte[] { 0x50, 3 }, "2.0.3")]
+	[InlineData(new byte[] { 0x78, 3 }, "2.40.3")]
+	[InlineData(new byte[] { 0x81, 0x00, 3 }, "2.48.3")]
+	[InlineData(new byte[] { 0x88, 0x37, 3 }, "2.999.3")]
+	public void DecodesTheCombinedFirstTwoOidArcs(byte[] oid, string expected)
+	{
+		var binding = Tlv(0x30, Tlv(0x06, oid), Int(61));
+		var reply = Sensor().ParseVarBinds(Response(7, 0, 0, Community, binding), 7);
+		Assert.NotNull(reply);
+		Assert.True(reply.Vars.ContainsKey(expected));
+	}
+
+	[Theory]
+	[InlineData(new byte[] { })]
+	[InlineData(new byte[] { 0x81 })]
+	[InlineData(new byte[] { 0x2B, 0x81 })]
+	[InlineData(new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0x7F })]
+	public void RejectsAnEmptyTruncatedOrOverflowingOid(byte[] oid)
+	{
+		var binding = Tlv(0x30, Tlv(0x06, oid), Int(61));
+		Assert.Null(Sensor().ParseVarBinds(Response(7, 0, 0, Community, binding), 7));
+	}
+
 	/// <summary>noSuchName names the varbind in the error index — the retry depends on it.</summary>
 	[Fact]
 	public void CarriesTheErrorIndexBack()

@@ -1776,6 +1776,8 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// version, so reading them the other way round could pair an old list with a new version:
 		// the old numbers were shown, the new version recorded, and the fresh list counted as
 		// already displayed — up to 62 seconds of showing the previous reading.
+		// The timestamp is also written before the version's full barrier: acquiring a new
+		// version makes its timestamp visible. Moving the timestamp after it would break that.
 		var version = Volatile.Read(ref _disksVersion);
 		var disks = _r.Disks;   // one read of the field: it is replaced whole from a pool thread
 		var changed = version != _shownDisks;

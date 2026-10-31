@@ -655,7 +655,8 @@ public sealed class Config : IGuidStore
 				stream.Write(bytes, 0, bytes.Length);
 				stream.Flush(flushToDisk: true);
 			}
-			if (!File.Exists(Path)) File.Move(temp, Path);
+			// Another writer can create the destination after Exists returned false.
+			if (!File.Exists(Path)) File.Move(temp, Path, overwrite: true);
 			else
 			{
 				// Replace first: it keeps what the old file carried, its ACL and owner among them.

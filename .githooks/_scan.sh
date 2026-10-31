@@ -26,6 +26,7 @@ scan_generic_pattern() {
 # skipped, while `scan_text` looked in the right place. Two resolvers, two
 # answers, and the difference decided whether a secret was published.
 # Prints the path (which may not exist) on stdout.
+# Returns non-zero with a diagnostic when no repository root can be resolved.
 # Made absolute with cd, not with --path-format=absolute: that is Git 2.31+,
 # and an older rev-parse echoes an option it does not know back as output
 # instead of failing — a non-empty answer pointing nowhere, the worktree bug
@@ -36,7 +37,12 @@ scan_denylist_path() {
   if [ -n "$scan_common" ] && [ -d "$scan_common" ]; then
     scan_sp="$(dirname "$(cd "$scan_common" && pwd)")/.sanitize-patterns"
   else
-    scan_sp="$(git rev-parse --show-toplevel)/.sanitize-patterns"
+    scan_root=$(git rev-parse --show-toplevel 2>/dev/null) || scan_root=
+    if [ -z "$scan_root" ]; then
+      echo "BLOCKED: cannot determine the repository root — the personal-data check cannot run." >&2
+      return 1
+    fi
+    scan_sp="$scan_root/.sanitize-patterns"
   fi
   if [ ! -f "$scan_sp" ] && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/traymon/sanitize-patterns" ]; then
     scan_sp="${XDG_CONFIG_HOME:-$HOME/.config}/traymon/sanitize-patterns"
@@ -81,7 +87,7 @@ scan_text() {
   # The MAIN worktree's root, not this worktree's — see scan_denylist_path,
   # which both hooks now share. Fall back to a shared user-level copy, and if
   # there is none, SAY so instead of skipping in silence.
-  scan_sp=$(scan_denylist_path)
+  scan_sp=$(scan_denylist_path) || return 1
   if [ ! -f "$scan_sp" ]; then
     echo "WARN: .sanitize-patterns not found (looked in $scan_sp) — the personal-data check is SKIPPED."
   fi

@@ -157,13 +157,17 @@ git -C "$repo" reset -q
 #    reads the file anyway — root — cannot show this, and is told so rather than counted.
 #    MSYS_NO_PATHCONV: Git Bash otherwise rewrites `/deny` into a path under its install folder.
 printf 'zaphod\\.example\\.invalid\n' > "$repo/.sanitize-patterns"
+unreadable_reason="this account reads it anyway, e.g. root or an ACL override"
 if command -v icacls >/dev/null 2>&1; then
   MSYS_NO_PATHCONV=1 icacls "$(cygpath -w "$repo/.sanitize-patterns")" /deny "$USERDOMAIN\\$USERNAME:(RD)" >/dev/null 2>&1 || true
 else
   chmod 000 "$repo/.sanitize-patterns"
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) unreadable_reason="Windows without icacls: chmod cannot remove NTFS read access; case 10 was not checked" ;;
+  esac
 fi
 if cat "$repo/.sanitize-patterns" >/dev/null 2>&1; then
-  echo "  skip pre-commit: unreadable denylist (this account reads it anyway)"
+  echo "  skip pre-commit: unreadable denylist ($unreadable_reason)"
 else
   echo "host = zaphod.example.invalid" > "$repo/c.txt"
   git -C "$repo" add c.txt
@@ -175,5 +179,14 @@ fi
 rm -f "$repo/.sanitize-patterns"
 
 echo ""
+# A failed root lookup must refuse the scan, not invent /.sanitize-patterns and
+# report a clean result after skipping the personal-data check.
+rc=0
+output=$(sh -c '. "$1/_scan.sh"; git() { return 1; }; scan_text test clean' sh "$hooks" 2>&1) || rc=$?
+check "scanner: an unresolved repository root refuses the scan" 1 "$rc"
+rc=0
+printf '%s' "$output" | grep -q 'cannot determine the repository root' || rc=$?
+check "scanner: an unresolved repository root has a specific diagnostic" 0 "$rc"
+
 echo "passed $passed, failed $failed"
 [ "$failed" -eq 0 ]

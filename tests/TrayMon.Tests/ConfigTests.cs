@@ -184,6 +184,38 @@ public sealed class ConfigTests : IDisposable
 		Assert.False(File.Exists(Config.Path + ".tmp"));
 	}
 
+	[Fact]
+	public void SaveReplacesAndRecreatesTheCompleteSettingsFile()
+	{
+		var config = new Config();
+		Assert.True(config.Save(out var error), error);
+		config.For("cpu").Label = "Процессор";
+		Assert.True(config.Save(out error), error);
+		Assert.Equal("Процессор", Config.Read().Get("cpu").Label);
+
+		File.Delete(Config.Path);
+		config.For("cpu").Label = "Новый процессор";
+		Assert.True(config.Save(out error), error);
+		Assert.Equal("Новый процессор", Config.Read().Get("cpu").Label);
+		Assert.False(File.Exists(Config.Path + ".tmp"));
+	}
+
+	[Fact]
+	public void AFailedSavePreservesTheLockedSettingsFile()
+	{
+		var config = new Config();
+		Assert.True(config.Save(out var error), error);
+		var before = File.ReadAllBytes(Config.Path);
+		using (var locked = new FileStream(Config.Path, FileMode.Open, FileAccess.Read, FileShare.Read))
+		{
+			config.For("cpu").Label = "Процессор";
+			Assert.False(config.Save(out error));
+			Assert.NotEmpty(error);
+		}
+		Assert.Equal(before, File.ReadAllBytes(Config.Path));
+		Assert.False(File.Exists(Config.Path + ".tmp"));
+	}
+
 	/// <summary>
 	/// A pair with the red threshold below the yellow one used to load happily: the plate could
 	/// turn red while Score() refused to rank it at all, so the summary icon left it out.

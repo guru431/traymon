@@ -24,6 +24,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\TrayMon.csproj" />
+    <None Include="..\..\tools\Check-ReadmeOutput.ps1" Link="Check-ReadmeOutput.ps1" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

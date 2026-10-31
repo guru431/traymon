@@ -4,6 +4,38 @@
 не сделана. Файл существует ровно затем, чтобы одно и то же не подавалось заново —
 еженедельный `agents-md-sync-check` делает это каждую неделю. Отсюда ничего не удаляется.
 
+## 2026-10-31 · code-review role:review: При noSuchName из varbind-а удаляется элемент по ErrorIndex,... [P3]
+**Context:** автоматическое ревью кода, `src/UpsSensor.cs:Read`, цикл retry, category=correctness
+**What:** При noSuchName из varbind-а удаляется элемент по ErrorIndex, но _dropped пополняется до проверки, что индекс указывает на ещё не удалённый OID. Если агент в нескольких подряд ответах называет один и тот же индекс после смещения списка, за три попытки можно удалить не тот varbind (индексы сдвигаются после каждого RemoveAt). На практике агенты называют корректный индекс каждый раз, поэтому это краевой случай.
+**Evidence:** `_dropped.Add(_oids[reply.ErrorIndex - 1]);`
+**Proposal:** Проверять, что _oids[reply.ErrorIndex-1] ещё не входит в _dropped, либо удалять по значению OID, а не по индексу.
+**Status:** wontfix
+**Resolved:** 2026-10-31 — SNMPv1 ErrorIndex относится к списку varbind текущего запроса. Get(_oids) отправляет уже укороченный список, а добавленный в _dropped OID немедленно удаляется из _oids. Повторный индекс правомерно указывает на следующий OID; проверка Contains или удаление по значению не исправляет неисправный агент и не меняет результат. Границы индекса уже проверены.
+
+## 2026-10-31 · code-review role:review: Несинхронизированный порядок публикации у фоновых ридеров: в... [P2]
+**Context:** автоматическое ревью кода, `src/Program.cs:RefreshDisks/RefreshRaidDisk/RefreshUps` и `ShowDisks/ShowRaidDisks/ShowUps`, category=bug
+**What:** Несинхронизированный порядок публикации у фоновых ридеров: в RefreshDisks сначала пишется список (_r.Disks = ...), затем Volatile.Write(ref _r.DisksAt, ...) и только потом Interlocked.Increment(ref _disksVersion). Семья читает в порядке version → data → Fresh(At): UI-поток может прочитать новый version, затем новый список, но старый DisksAt (записанный после списка, но до version — ридер мог быть вытеснен между Volatile.Write(_r.DisksAt) и Increment). Тогда Fresh(DisksAt) оценивает СТАРЫЙ timestamp при НОВЫХ данных: свежий снапшот признаётся устаревшим, иконки серые/«опрос не завершился» на один тик, а при пограничных значениях MaxAgeMs — дольше. То же для _r.RaidAt/_raidVersion и _r.UpsAt/_upsVersion. Комментарий «version first, list second» описывает порядок чтения, но порядок записи в ридере не даёт гарантии, что At-таймстемп, прочитанный после version, соответствует тому же снапшоту.
+**Evidence:** `_r.Disks = Program.DiskTemps(_disk, _lhm); Volatile.Write(ref _r.DisksAt, Environment.TickCount64); Interlocked.Increment(ref _disksVersion);`
+**Proposal:** Писать таймстемп последним, после инкремента версии (data → version → At), либо публиковать снапшот атомарно (один immutable record с полями List+At+Version через Volatile.Read/Write одной ссылки), чтобы семья всегда видела согласованную тройку.
+**Status:** wontfix
+**Resolved:** 2026-10-31 — Описанное чтение новой версии со старым штампом невозможно: штамп записан до Interlocked.Increment (полный барьер), а версия читается через Volatile.Read (acquire) до штампа. Предложенный порядок data → version → At как раз создал бы это окно. Чтение старой версии с более новыми данными не теряет обновление: следующий тик увидит новую версию. Перестройка всех снимков ради заявленного сценария не требуется; пояснение добавлено к ShowDisks.
+
+## 2026-10-31 · code-review role:review: В RunOnce perf, gpu и lhm освобождаются через using, а DiskS... [P3]
+**Context:** автоматическое ревью кода, `src/Program.cs:RunOnce`, создание disk/hdd/ups, category=bug
+**What:** В RunOnce perf, gpu и lhm освобождаются через using, а DiskSensor, HddSensor и UpsSensor создаются без using и без Dispose до выхода процесса. Если у HddSensor/UpsSensor есть неуправляемые ресурсы (сокет SNMP, кэш процессов smartctl), они не освобождаются детерминированно; для одноразового консольного процесса это не критично, но расходится с практикой остального файла.
+**Evidence:** `var disk = new DiskSensor(); var hdd = new HddSensor(config.Tools); var ups = new UpsSensor(config.Ups);`
+**Proposal:** Обернуть в using (или объявить их вместе с perf/gpu/lhm), если типы реализуют IDisposable.
+**Status:** wontfix
+**Resolved:** 2026-10-31 — DiskSensor, HddSensor и UpsSensor не реализуют IDisposable и не держат открытые нативные ресурсы между вызовами. DiskSensor закрывает каждый дескриптор в finally; HddSensor запускает smartctl под using var Process; UpsSensor создаёт UdpClient под using внутри Get. Добавление using к самим датчикам не компилируется и не исправляет утечку.
+
+## 2026-10-31 · code-review role:review: Мелочь: top инициализируется double.MinValue и сравнение «sc... [P3]
+**Context:** автоматическое ревью кода, `src/Program.cs:ShowWorst`, инициализация top, category=correctness
+**What:** Мелочь: top инициализируется double.MinValue и сравнение «score <= top → continue» корректно, но если единственный скоринговый слот имеет score ровно double.MinValue (невозможно для Scale.Score на практике) — не дефект. Реальная мелочь: при scored>0, но worst==null и worstLevel>Normal ветка «ок» не выполняется, а следующая Show использует worst в LabelOf(worst) — worst там гарантированно не null, т.к. при top>=Scale.Yellow worst установлен. Проверено — несоответствия нет; находка отозвана.
+**Evidence:** `if (worst is null || (worstLevel == Alarm.Normal && top < Scale.Yellow))`
+**Proposal:** Действий не требуется.
+**Status:** wontfix
+**Resolved:** 2026-10-31 — Находка сама отозвана автором и подтверждена чтением ShowWorst: условие worst is null немедленно ведёт в ветку с return; LabelOf(worst) ниже доступен только при ненулевом worst. Дополнительная проверка не нужна.
+
 ## 2026-10-27 · code-review: секция `Log` в `TrayApp` разыменовывается без `?.` [P3]
 **Context:** еженедельное автоматическое ревью кода, `src/Program.cs:WriteLogLine/FlushLog/Roll`,
 `if (_dry || !_config.Log.Enabled) return;`, category=inconsistency.

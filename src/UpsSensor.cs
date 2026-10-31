@@ -113,6 +113,8 @@ public sealed class UpsSensor
 				if (reply.Error == NoSuchName &&
 					reply.ErrorIndex >= 1 && reply.ErrorIndex <= _oids.Count && _oids.Count > 1)
 				{
+					// ErrorIndex addresses this request's list; the same index on a retry names
+					// the next OID, because the previously dropped one is no longer requested.
 					_dropped.Add(_oids[reply.ErrorIndex - 1]);
 					_oids.RemoveAt(reply.ErrorIndex - 1);
 					continue;
@@ -375,14 +377,26 @@ public sealed class UpsSensor
 
 	private static string DecodeOid(byte[] raw)
 	{
-		if (raw.Length == 0) return "";
-		var parts = new List<long> { raw[0] / 40, raw[0] % 40 };
+		if (raw.Length == 0 || (raw[^1] & 0x80) != 0)
+			throw new FormatException("BER: незавершённый OID");
+		var parts = new List<long>();
 		long value = 0;
-		for (var i = 1; i < raw.Length; i++)
+		foreach (var b in raw)
 		{
-			value = (value << 7) | (uint)(raw[i] & 0x7F);
-			if ((raw[i] & 0x80) == 0) { parts.Add(value); value = 0; }
-			else if (value > int.MaxValue) return "";   // a sub-identifier this long is not an OID we asked for
+			value = (value << 7) | (uint)(b & 0x7F);
+			if (value > (parts.Count == 0 ? (long)uint.MaxValue + 80 : uint.MaxValue))
+				throw new FormatException("BER: слишком большая дуга OID");
+			if ((b & 0x80) != 0) continue;
+			// The first two arcs share one base-128 integer, not necessarily one byte.
+			// Only roots 0 and 1 have second arcs below 40; all larger values belong to root 2.
+			if (parts.Count == 0)
+			{
+				var root = value < 80 ? value / 40 : 2;
+				parts.Add(root);
+				parts.Add(value - root * 40);
+			}
+			else parts.Add(value);
+			value = 0;
 		}
 		return string.Join('.', parts);
 	}
