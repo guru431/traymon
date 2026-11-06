@@ -67,6 +67,8 @@ public sealed class UpsSensor
 	private readonly List<string> _dropped = new();
 
 	private int _requestId = 1;
+	private int _rediscover;
+	private readonly Func<IReadOnlyList<string>, SnmpReply> _query;
 
 	/// <summary>True once the agent has answered at least once; until then the icon stays hidden,
 	/// exactly as the GPU icons do on a machine without an NVIDIA driver.</summary>
@@ -83,6 +85,7 @@ public sealed class UpsSensor
 
 	public UpsSensor(UpsSettings settings)
 	{
+		_query = Get;
 		_host = settings.Host;
 		_port = settings.Port;
 		_timeoutMs = settings.TimeoutMs;
@@ -90,6 +93,8 @@ public sealed class UpsSensor
 		// into '?' — the agent then refused it, and nothing said the encoding was to blame.
 		_community = Encoding.UTF8.GetBytes(settings.Community);
 	}
+
+	internal UpsSensor(UpsSettings settings, Func<IReadOnlyList<string>, SnmpReply> query) : this(settings) => _query = query;
 
 	/// <summary>
 	/// Blocks for up to the socket timeout, so the caller runs it off the UI thread. The whole
@@ -99,24 +104,32 @@ public sealed class UpsSensor
 	/// </summary>
 	public void Read(Readings r)
 	{
+		if (Interlocked.Exchange(ref _rediscover, 0) != 0)
+		{
+			_dropped.Clear();
+			_oids.Clear();
+			_oids.AddRange(AllOids);
+		}
 		Dictionary<string, (byte Tag, byte[] Raw)> answer = null;
 		try
 		{
 			// At most three passes: each failed one drops exactly the varbind the agent named.
 			for (var attempt = 0; attempt < 3 && answer is null; attempt++)
 			{
-				var reply = Get(_oids);
+				var requested = _oids.ToArray();
+				var reply = _query(requested);
 				if (reply.Error == 0) { answer = reply.Vars; break; }
 				// Only noSuchName removes a varbind. Any non-zero status used to, so one bad
 				// moment from the agent could cost the charge or the power status for the rest of
 				// the session — and nothing, not even "Опросить датчики сейчас", brought it back.
 				if (reply.Error == NoSuchName &&
-					reply.ErrorIndex >= 1 && reply.ErrorIndex <= _oids.Count && _oids.Count > 1)
+					reply.ErrorIndex >= 1 && reply.ErrorIndex <= requested.Length && requested.Length > 1)
 				{
 					// ErrorIndex addresses this request's list; the same index on a retry names
 					// the next OID, because the previously dropped one is no longer requested.
-					_dropped.Add(_oids[reply.ErrorIndex - 1]);
-					_oids.RemoveAt(reply.ErrorIndex - 1);
+					var dropped = requested[reply.ErrorIndex - 1];
+					_dropped.Add(dropped);
+					_oids.Remove(dropped);
 					continue;
 				}
 				throw new InvalidOperationException(
@@ -153,7 +166,7 @@ public sealed class UpsSensor
 			RunTimeMin = ticks.HasValue ? ticks.Value / 6000.0 : null,   // hundredths of a second → minutes
 			Load = InRange(Number(answer, LoadOid), 0, 200),
 			Status = status.HasValue ? (int)status.Value : null,
-			NeedsNewBattery = Number(answer, ReplaceOid) == NeedsReplacing,
+			NeedsNewBattery = ReplacementState(Number(answer, ReplaceOid)),
 		};
 	}
 
@@ -161,12 +174,14 @@ public sealed class UpsSensor
 	/// Asks for the full set of OIDs again. What an agent carries changes when PowerChute is
 	/// upgraded or the UPS is replaced, and a varbind dropped as noSuchName had no way back.
 	/// </summary>
-	public void Rediscover()
+	public void Rediscover() => Interlocked.Exchange(ref _rediscover, 1);
+
+	internal static bool? ReplacementState(double? value) => value switch
 	{
-		_dropped.Clear();
-		_oids.Clear();
-		_oids.AddRange(AllOids);
-	}
+		1 => false,
+		NeedsReplacing => true,
+		_ => null,
+	};
 
 	private static double? InRange(double? value, double min, double max) =>
 		value.HasValue && value.Value >= min && value.Value <= max ? value : null;
@@ -194,7 +209,7 @@ public sealed class UpsSensor
 		public Dictionary<string, (byte Tag, byte[] Raw)> Vars;
 	}
 
-	private SnmpReply Get(List<string> oids)
+	private SnmpReply Get(IReadOnlyList<string> oids)
 	{
 		var bindings = new List<byte>();
 		foreach (var oid in oids)

@@ -346,6 +346,9 @@ public sealed class Config : IGuidStore
 
 	public Dictionary<string, IconSettings> Icons { get; set; } = new();
 
+	/// <summary>Window/menu palette; null follows system colours. High contrast always wins.</summary>
+	public string Theme { get; set; }
+
 	/// <summary>
 	/// Which tray identity each source of a family was given: pool name → source key → GUID.
 	/// Written by the program, not meant to be edited. It exists because the assignment used to

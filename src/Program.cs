@@ -193,7 +193,7 @@ internal static class Program
 				$"{(r.Battery.MinutesLeft.HasValue ? ", " + r.Battery.MinutesLeft.Value.ToString("0", ci) + " min left" : "")}");
 		if (ups.Present)
 			Say($"ups      {Fmt(r.Ups.Charge)} %      {r.Ups.StatusText}, " +
-				$"{Fmt(r.Ups.RunTimeMin)} min left, load {Fmt(r.Ups.Load)} %{(r.Ups.NeedsNewBattery ? ", REPLACE BATTERY" : "")}");
+				$"{Fmt(r.Ups.RunTimeMin)} min left, load {Fmt(r.Ups.Load)} %{(r.Ups.NeedsNewBattery == true ? ", REPLACE BATTERY" : "")}");
 		else
 			Say($"ups      no answer over SNMP at <host from TrayMon.json> ({ups.LastError})");
 
@@ -259,6 +259,8 @@ internal static class Program
 		hide.Hide(Environment.ProcessPath, "<app>\\TrayMon.exe");
 		hide.Hide(config?.Tools?.Smartctl, "<smartctl>");
 		hide.Hide(config?.Log?.Path, "<log>");
+		if (config?.Icons is not null)
+			foreach (var settings in config.Icons.Values) hide.Hide(settings?.Label, "<label>");
 		return hide;
 	}
 
@@ -373,7 +375,7 @@ internal static class Program
 /// Every icon is a slot with a stable id; which slots are shown, what colour their plate is
 /// and how they are labelled comes from <see cref="Config"/> and is edited from the tray menu.
 /// </summary>
-internal sealed class TrayApp : ApplicationContext, IGuidStore
+internal sealed partial class TrayApp : ApplicationContext, IGuidStore
 {
 	/// <summary>Built-in poll rate. <see cref="Config.TickMs"/> may raise it, never lower it.</summary>
 	private const int TickMs = 2000;
@@ -651,6 +653,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		public TrayValueIcon Icon;
 		public string LastText;
 		public double? LastSeverity;
+		public int? AggregateLevel;
 
 		/// <summary>The number itself, in the unit the icon draws, kept for the CSV trail: the
 		/// drawn text changes unit under its own feet (GB to TB, hours to days, rpm to per cent)
@@ -736,6 +739,8 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private readonly bool _ownsSensors = true;
 
 	private readonly ContextMenuStrip _menu = new();
+	private TrayValueIcon _menuOwner;
+	private ContextMenuStrip _sourceMenu;
 
 	/// <summary>True while the "Показывать значки" list is open, which is when a click on an item
 	/// must not close the menu. See the handler in the constructor.</summary>
@@ -771,6 +776,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	// What the UPS last said about its bypass and its battery, for the warning-level events. Null
 	// until its first answer: a UPS already in bypass when the program starts is reported too.
 	private bool? _lastBypass, _lastReplace;
+	private long _lastBypassAt, _lastReplaceAt;
 
 	private long _lastLogAt = long.MinValue / 4;
 
@@ -855,6 +861,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// its moment, the level it went to and whether the source is a required one, so the summary on
 	/// coming back to the session can count what was missed.</summary>
 	private readonly Queue<(long At, int Level, bool Required, string Line)> _journal = new();
+	internal Action<string, bool> NotificationSink;
 
 	// Sources that are simply not present on this machine stop being asked so often.
 	private int _upsFailures, _raidFailures;
@@ -951,6 +958,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		_hdd = hdd ?? new HddSensor(_config.Tools);
 		_ups = ups ?? new UpsSensor(_config.Ups);
 		_intervalMs = Math.Max(TickMs, _config.TickMs);
+		WindowTheme.Current = _config.Theme;
 
 		// The pools remember what they handed out, in the settings file: the assignment used to
 		// live only in memory, so after a restart with one device absent the next device took its
@@ -995,6 +1003,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		{
 			if (_pickingIcons && e.CloseReason == ToolStripDropDownCloseReason.ItemClicked) e.Cancel = true;
 		};
+		_menu.Closed += (_, _) => { _menuOwner?.ReturnFocus(); _menuOwner = null; };
 
 		if (_dry) return;
 
@@ -1192,17 +1201,13 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 				// is worth seeing is what moved afterwards — fading, coming back, changing level.
 				if (i == 0) continue;
 				report.AppendLine($"  tick {(i + 1).ToString(CultureInfo.InvariantCulture)}: " +
-								  $"{slot.Id} {(known ? was : "—")} → {now}");
+								  $"metric {_order.IndexOf(slot) + 1} {(known ? was : "—")} → {now}");
 			}
 		}
 
 		report.AppendLine($"icons: {_order.Count(s => s.Settings.Enabled)} shown of {_order.Count} known" +
 						  $"   ticks: {ticks}   errors: {_tickErrors}");
-		foreach (var slot in _order)
-			report.AppendLine(
-				$"  {(slot.Settings.Enabled ? "on " : "off")} {slot.Guid.ToString()[^2..]}  " +
-				$"{slot.Id,-28} {(slot.LastText ?? "—"),5}  {State(slot)} {LabelOf(slot)}   " +
-				$"{(slot.LastDetail + slot.StatsText + slot.DetailTail).Replace("\n", " · ")}");
+		AppendPublicSlots(report);
 		foreach (var line in Overflows()) report.AppendLine("  " + line);
 		if (_lastTickError is not null) report.AppendLine("  last error: " + _lastTickError);
 		// Renders and shell calls are zero here by construction, and saying so matters: they are
@@ -1436,6 +1441,8 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	/// <returns>False when this id can never be given a placeholder, whatever turns up.</returns>
 	private bool Expect(string id)
 	{
+		// An unproven old owner must not reserve a GUID that a newly identified disk needs.
+		if (LegacyDiskId(id)) return false;
 		switch (id)
 		{
 			case "cpu.temp": Slot(id, CpuTempMetric, CpuTempGuid); return true;
@@ -1457,6 +1464,9 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		}
 		return false;
 	}
+
+	private static bool LegacyDiskId(string id) =>
+		id.StartsWith("disk.", StringComparison.Ordinal) && !id.StartsWith("disk.raid.", StringComparison.Ordinal) && !id.Contains('@');
 
 	/// <summary>
 	/// Whether this deadline has passed, moving it on if it has. Wall clock, so a source keeps its
@@ -1727,11 +1737,13 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			// A duty cycle is not proof of rotation: the driver reports what it asked for, and a
 			// seized fan reports the same 35 %. With no tachometer the standstill alarm has nothing
 			// to stand on, so it is not raised — and the tooltip says why.
-			Record(fan, speed, byDuty ? 0 : StallSeverity(fan, g.FanRpm.Value, g.FanDuty),
+			var fanSeverity = byDuty ? 0 : fan.Settings.Stall == "zero-ok"
+				? (g.DrivenFanStopped ? 100 : 0) : StallSeverity(fan, g.FanRpm.Value, g.FanDuty);
+			Record(fan, speed, fanSeverity,
 				unit: byDuty ? "%" : "об/мин", stamp: _r.GpusAt);
 			Show(fan,
 				byDuty ? Whole(g.FanDuty) : Rpm(g.FanRpm.Value),
-				byDuty ? 0 : StallSeverity(fan, g.FanRpm.Value, g.FanDuty),
+				fanSeverity,
 				byDuty
 					? $"{Pct(g.FanDuty)} задания (драйвер не сообщает обороты, остановку не видно)"
 					: $"{g.FanRpm.Value.ToString("0", ci)} об/мин   задание {Pct(g.FanDuty)}");
@@ -1763,12 +1775,9 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		};
 
 	/// <summary>
-	/// One icon per directly attached disk, keyed by model — never by position in the list.
-	/// A USB NVMe enclosure, or simply a different enumeration order after a reboot, moved every
-	/// index along: "disk.0" then kept the label of one drive while showing the temperature of
-	/// another, and carried its colour and thresholds over with it. Identical models are told
-	/// apart by an ordinal suffix, which is the best this source offers — the storage property
-	/// query returns a model, not a serial.
+	/// One icon per directly attached disk. A unique serial identifies its owner even when
+	/// another drive is absent. Legacy model-only entries cannot prove that ownership and stay
+	/// in the settings file untouched instead of silently configuring a different disk.
 	/// </summary>
 	private void ShowDisks()
 	{
@@ -1795,7 +1804,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		{
 			var d = disks[i];
 			var key = _diskKeysOfList[i];
-			var slot = Pooled($"disk.{key}", DiskMetric, _diskPool, key, key);
+			var slot = Pooled($"disk.{key}", DiskMetric, _diskPool, key, d.Name);
 			if (slot is null) continue;
 
 			// The drive's own limits replace the built-in 60/70 when it reports a sane pair: an
@@ -1826,29 +1835,25 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	}
 
 	/// <summary>
-	/// A key per disk: the model, plus an ordinal when the machine has more than one of the same
-	/// model. Not the index in the list — a USB NVMe enclosure, or a different enumeration order
-	/// after a reboot, moved every index along, and "disk.0" then kept one drive's label while
-	/// showing another's temperature, colour and thresholds included. The storage property query
-	/// returns a model and not a serial number, so this is as stable as this source gets.
+	/// Hardware keys never depend on which other disks answered this time. An anonymous or
+	/// duplicated serial cannot establish an owner; its distinct namespace makes that explicit.
 	/// </summary>
 	internal static string[] DiskKeys(List<DiskReading> disks)
 	{
-		// Ordinals are handed out in serial-number order, not in enumeration order. Two drives of
-		// the same model swapped their "#2" whenever the storage stack enumerated them the other
-		// way round, and the settings and the tray position went with it.
-		var order = Enumerable.Range(0, disks.Count)
-			.OrderBy(i => disks[i].Serial ?? "￿", StringComparer.OrdinalIgnoreCase)
-			.ToArray();
 		var keys = new string[disks.Count];
 		var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-		foreach (var i in order)
+		for (var i = 0; i < disks.Count; i++)
 		{
+			var d = disks[i];
+			if (!string.IsNullOrWhiteSpace(d.Serial) &&
+				disks.Count(other => string.Equals(other.Serial?.Trim(), d.Serial.Trim(), StringComparison.OrdinalIgnoreCase)) == 1)
+			{
+				keys[i] = d.Name + "@" + d.Serial.Trim().ToUpperInvariant();
+				continue;
+			}
 			counts.TryGetValue(disks[i].Name, out var seen);
 			counts[disks[i].Name] = seen + 1;
-			keys[i] = seen == 0
-				? disks[i].Name
-				: $"{disks[i].Name}#{(seen + 1).ToString(CultureInfo.InvariantCulture)}";
+			keys[i] = d.Name + "@unknown#" + (seen + 1).ToString(CultureInfo.InvariantCulture);
 		}
 		return keys;
 	}
@@ -2129,19 +2134,24 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		string worse = null;
 		if (ups.Answered)
 		{
-			if (ups.Status.HasValue)
+			if (ups.Bypass.HasValue)
 			{
-				if (ups.Bypass && _lastBypass != true)
+				if (ups.Bypass == true && _lastBypass != true)
 					worse = $"ИБП работает через байпас ({ups.StatusText}) — отключение сети нагрузка может не пережить.";
-				else if (!ups.Bypass && _lastBypass == true)
+				else if (ups.Bypass == false && _lastBypass == true)
 					worse = "ИБП вышел из байпаса.";
 				_lastBypass = ups.Bypass;
+				_lastBypassAt = _r.UpsAt;
 			}
-			if (ups.NeedsNewBattery && _lastReplace != true)
+			if (ups.NeedsNewBattery == true && _lastReplace != true)
 				worse = (worse is null ? "" : worse + " ") + "ИБП просит заменить батарею.";
-			else if (!ups.NeedsNewBattery && _lastReplace == true)
+			else if (ups.NeedsNewBattery == false && _lastReplace == true)
 				worse = (worse is null ? "" : worse + " ") + "ИБП больше не просит заменить батарею.";
-			_lastReplace = ups.NeedsNewBattery;
+			if (ups.NeedsNewBattery.HasValue)
+			{
+				_lastReplace = ups.NeedsNewBattery;
+				_lastReplaceAt = _r.UpsAt;
+			}
 		}
 		// One message, not two: a slot is notified once per tick, and the second would be lost.
 		if (power is not null || worse is not null)
@@ -2159,9 +2169,17 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			? $"   ещё {ups.RunTimeMin.Value.ToString("0", CultureInfo.InvariantCulture)} мин"
 			: "";
 		var load = ups.Load.HasValue ? $"   нагрузка {Pct(ups.Load)}" : "";
-		var replace = ups.NeedsNewBattery ? "   ТРЕБУЕТ ЗАМЕНЫ БАТАРЕИ" : "";
+		var replace = ups.NeedsNewBattery == true ? "   ТРЕБУЕТ ЗАМЕНЫ БАТАРЕИ" : "";
+		if (ups.NeedsNewBattery is null)
+			replace += UnknownUpsCondition("замена батареи", _lastReplace, _lastReplaceAt);
+		if (ups.Bypass is null)
+			replace += UnknownUpsCondition("байпас", _lastBypass, _lastBypassAt);
 		Show(slot, Whole(ups.Charge), severity, $"{Pct(ups.Charge)} {ups.StatusText}{minutes}{load}{replace}");
 	}
+
+	private static string UnknownUpsCondition(string name, bool? previous, long at) =>
+		$"   {name}: неизвестно" + (previous.HasValue
+			? $" (было {(previous.Value ? "да" : "нет")}, {Math.Max(0, Environment.TickCount64 - at) / 1000} с назад)" : "");
 
 	/// <summary>
 	/// How bad the UPS state is, on the inverted scale the plate is coloured by.
@@ -2177,13 +2195,15 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// Under five minutes of runtime counts here too. It used to be applied only after this
 		// early return, so a UPS reporting three minutes left and no charge gauge was "unknown".
 		var runningOut = Steps.ShortRuntime(ups.RunTimeMin, slot.Level);
-		if (!ups.Charge.HasValue && !ups.Degraded && !ups.NeedsNewBattery && !runningOut)
+		var pendingProblem = (ups.Bypass is null && _lastBypass == true) ||
+			(ups.NeedsNewBattery is null && _lastReplace == true);
+		if (!ups.Charge.HasValue && !ups.Degraded && ups.NeedsNewBattery != true && !runningOut && !pendingProblem)
 			return null;
 
 		var severity = ups.Charge.HasValue ? 100 - ups.Charge.Value : 0;
 		// Under five minutes of runtime is red whatever the charge gauge claims.
 		if (runningOut) severity = Math.Max(severity, CritOf(slot));
-		if (ups.Degraded || ups.NeedsNewBattery) severity = Math.Max(severity, WarnOf(slot));
+		if (ups.Degraded || ups.NeedsNewBattery == true || pendingProblem) severity = Math.Max(severity, WarnOf(slot));
 		return severity;
 	}
 
@@ -2495,6 +2515,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 
 		slot.LastText = text;
 		slot.LastSeverity = severity;
+		slot.AggregateLevel = level;
 		slot.LastDetail = detail;
 		slot.DetailTail = tail;
 		Push(slot, text, severity, level);
@@ -2513,6 +2534,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private void Push(IconSlot slot, string text, double? severity, int? forced = null)
 	{
 		// One level, for the plate, the journal, the notification and the summary icon alike.
+		forced ??= severity.HasValue ? slot.AggregateLevel : null;
 		var level = forced ?? Alarm.LevelOf(slot.Level, severity, WarnOf(slot), CritOf(slot), AlertsOn(slot));
 		if (forced.HasValue && !AlertsOn(slot)) level = Alarm.Normal;
 		NoteLevelChange(slot, level);
@@ -2564,9 +2586,10 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			return;
 		}
 		if (level == Alarm.Dead) return;
-		if (was == Alarm.Dead && level >= Alarm.Normal && required && level < Alarm.Critical)
+		if (was == Alarm.Dead && level >= Alarm.Normal && required)
 		{
-			Notify(slot, $"{LabelOf(slot)}: данные снова есть — {slot.LastDetail}", critical: false, asked: true);
+			Notify(slot, $"{LabelOf(slot)}: данные снова есть ({Alarm.Name(level)}) — {slot.LastDetail}",
+				critical: level == Alarm.Critical, asked: true);
 			return;
 		}
 
@@ -2591,6 +2614,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		if (!asked && !(slot.Settings.NotifyOnCritical ?? slot.Metric.NotifyByDefault)) return;
 		if (slot.NotifiedTick == _tick) return;
 		slot.NotifiedTick = _tick;
+		if (NotificationSink is not null) { NotificationSink(what, critical); return; }
 		Balloon("TrayMon", what, warning: critical);
 		// And into the Application log, where a server's existing monitoring will find it: a
 		// balloon needs somebody in front of the screen, and these are exactly the events for
@@ -2802,12 +2826,13 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	private bool LogRefused(string path)
 	{
 		if (string.Equals(path, _logCheckedPath, StringComparison.OrdinalIgnoreCase)) return _logRefusal is not null;
-		_logCheckedPath = path;
-		_logRefusal = null;
-		if (Autostart.WritableByNonAdmins(AppContext.BaseDirectory, out _)) return false;
-		if (!Autostart.UnsafeToRun(path, out var who)) return false;
-		_logRefusal = $"не пишется: его папку может изменить {who}, а TrayMon работает с правами администратора";
-		return true;
+		_logCheckedPath = null;
+		var install = Autostart.CheckFolder(AppContext.BaseDirectory);
+		var target = Autostart.CheckFile(path);
+		var refusal = Autostart.ExternalRefusal(install, target);
+		_logRefusal = refusal is null ? null : "не пишется: " + refusal;
+		if (install.Error is null && target.Error is null) _logCheckedPath = path;
+		return refusal is not null;
 	}
 
 	/// <summary>Rolls the trail over once it reaches its limit. A monitor that fills the disk it
@@ -3041,7 +3066,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		return slot.Metric.Plate;
 	}
 
-	private string LabelOf(IconSlot slot) => slot.Settings.Label ?? slot.DefaultLabel;
+	private string LabelOf(IconSlot slot) => _dry ? slot.Metric.Label : slot.Settings.Label ?? slot.DefaultLabel;
 
 	/// <summary>Digit colour chosen by the user; null lets the icon pick it by the plate colour.</summary>
 	private Color? InkOf(IconSlot slot) => slot.Settings.Ink switch
@@ -3127,7 +3152,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		// the two in one long list is how somebody reaches "Удалить TrayMon…" looking for a colour.
 		if (clicked is not null)
 		{
-			_menu.Items.Add(new ToolStripMenuItem($"{LabelOf(clicked)}: {clicked.LastText ?? "—"}") { Enabled = false });
+			_menu.Items.Add(new ToolStripMenuItem($"{LabelOf(clicked)} · {Reading(clicked)} · {Alarm.Name(clicked.Level)}") { Enabled = false });
 			_menu.Items.Add(new ToolStripSeparator());
 			_menu.Items.Add(MetricMenu(clicked));
 			_menu.Items.Add("Скрыть этот значок", null, (_, _) => SetEnabled(clicked, false));
@@ -3142,16 +3167,18 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		_menu.Items.Add("Выход", null, (_, _) => ExitThread());
 
 		icon.PrepareMenu();
-		_menu.Show(Cursor.Position);
+		_menuOwner = icon;
+		WindowTheme.Apply(_menu, _config.Theme);
+		_menu.Show(icon.MenuPosition);
 	}
 
 	/// <summary>Everything that belongs to one icon.</summary>
 	private ToolStripMenuItem MetricMenu(IconSlot clicked)
 	{
 		var menu = new ToolStripMenuItem("Настроить этот значок");
-		menu.DropDownItems.Add("Цвет фона…", null, (_, _) => PickColor(clicked));
-		menu.DropDownItems.Add(InkMenu(clicked));
+		menu.DropDownItems.Add("Оформление…", null, (_, _) => EditAppearance(clicked));
 		menu.DropDownItems.Add("Переименовать…", null, (_, _) => Rename(clicked));
+		menu.DropDownItems.Add(new ToolStripSeparator());
 		// Not offered where there is nothing to set: a fan is judged on standing still, and
 		// a metric that never alarms has no thresholds to type into. The dialog used to
 		// accept "600 rpm" into a scale that only ever holds 0 and 100, which quietly turned
@@ -3302,6 +3329,14 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		{
 			if (e.CloseReason == ToolStripDropDownCloseReason.ItemClicked) e.Cancel = true;
 		};
+		all.DropDown.KeyDown += (_, e) =>
+		{
+			if (e.KeyCode != Keys.Apps && !(e.Shift && e.KeyCode == Keys.F10) && !(e.Control && e.KeyCode == Keys.Enter)) return;
+			var selected = all.DropDownItems.Cast<ToolStripItem>().FirstOrDefault(i => i.Selected);
+			if (selected?.Tag is not IconSlot slot) return;
+			e.Handled = e.SuppressKeyPress = true;
+			ShowMetricSettings(slot, all.DropDown.PointToScreen(selected.Bounds.Location));
+		};
 		foreach (var group in Groups)
 		{
 			var members = _order
@@ -3315,10 +3350,15 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			all.DropDownItems.Add(new ToolStripMenuItem(group) { Enabled = false });
 			foreach (var slot in members)
 			{
-				var item = new ToolStripMenuItem(LabelOf(slot) + (slot.Dead ? "  (нет данных)" : ""))
+				var label = LabelOf(slot);
+				var caption = label.Length > 60 ? label[..57] + "…" : label;
+				var item = new VisibilityItem(caption + (slot.Dead ? "  (нет данных)" : ""),
+					() => ShowMetricSettings(slot, Cursor.Position))
 				{
 					Checked = slot.Settings.Enabled,
 					CheckOnClick = true,
+					Tag = slot,
+					ToolTipText = $"{label}\n{Reading(slot)} · {Alarm.Name(slot.Level)}\n{slot.Id}\nПКМ / Shift+F10 / Ctrl+Enter — настроить",
 				};
 				var captured = slot;
 				// The tick is put there by CheckOnClick before anything is asked of us, so a
@@ -3338,22 +3378,20 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		return all;
 	}
 
-	/// <summary>
-	/// Light or dark digits for this icon. "Авто" picks by the brightness of the plate, so a
-	/// light background chosen from the colour dialog gets black digits instead of white on white.
-	/// </summary>
-	private ToolStripMenuItem InkMenu(IconSlot slot)
+	/// <summary>Open a metric's commands without changing its visibility.</summary>
+	private void ShowMetricSettings(IconSlot slot, Point location)
 	{
-		var menu = new ToolStripMenuItem("Цвет цифр");
-		var current = slot.Settings.Ink;
-		foreach (var (label, value) in new[] { ("Авто", (string)null), ("Светлые", "light"), ("Тёмные", "dark") })
-		{
-			var choice = value;
-			var item = new ToolStripMenuItem(label) { Checked = current == choice };
-			item.Click += (_, _) => SetInk(slot, choice);
-			menu.DropDownItems.Add(item);
-		}
-		return menu;
+		var owner = _menuOwner;
+		_pickingIcons = false;
+		_menu.Close();
+		_sourceMenu?.Dispose();
+		_sourceMenu = new ContextMenuStrip();
+		using var metric = MetricMenu(slot);
+		while (metric.DropDownItems.Count > 0) _sourceMenu.Items.Add(metric.DropDownItems[0]);
+		_sourceMenu.Closed += (_, _) => owner?.ReturnFocus();
+		WindowTheme.Apply(_sourceMenu, _config.Theme);
+		owner?.PrepareMenu();
+		_sourceMenu.Show(location);
 	}
 
 	/// <summary>What the thresholds mean for this icon, in the units it is actually read in.</summary>
@@ -3394,28 +3432,18 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		Persist(slot, s => s.NotifyOnCritical = on == slot.Metric.NotifyByDefault ? null : on);
 	}
 
-	private void SetInk(IconSlot slot, string ink)
+	private void EditAppearance(IconSlot slot)
 	{
-		Persist(slot, s => s.Ink = ink);
-		slot.Icon?.SetInk(InkOf(slot));
-	}
-
-	private void PickColor(IconSlot slot)
-	{
-		using var dialog = new ColorDialog { Color = PlateOf(slot), FullOpen = true, AnyColor = true };
+		using var dialog = new AppearanceDialog(PlateOf(slot), slot.Metric.Plate,
+			slot.Settings.Color is null, slot.Settings.Ink, _config.Theme);
 		if (dialog.ShowDialog() != DialogResult.OK) return;
-		var color = $"#{dialog.Color.R:X2}{dialog.Color.G:X2}{dialog.Color.B:X2}";
-		Persist(slot, s => s.Color = color);
-		slot.Icon?.SetPlate(dialog.Color);
-
-		// A plate held at its warning colour ignores the chosen one, which looks like the
-		// setting did nothing.
-		if (slot.Icon?.IsAlerting == true)
-			Info($"Цвет сохранён, но сейчас значок подсвечен порогом " +
-				 $"({slot.LastSeverity?.ToString("0", CultureInfo.InvariantCulture)} ≥ " +
-				 $"{WarnOf(slot).ToString("0", CultureInfo.InvariantCulture)}).\n" +
-				 "Выбранный цвет появится, когда значение опустится ниже порога, либо снимите\n" +
-				 "галочку «Подсвечивать при перегрузке».");
+		if (!CatchUpWithFile()) return;
+		_config.Theme = dialog.Theme;
+		WindowTheme.Current = dialog.Theme;
+		foreach (Form open in Application.OpenForms) WindowTheme.Apply(open, dialog.Theme);
+		Persist(slot, s => { s.Color = dialog.Plate; s.Ink = dialog.Ink; });
+		slot.Icon?.SetPlate(PlateOf(slot));
+		slot.Icon?.SetInk(InkOf(slot));
 	}
 
 	private void SetAlerts(IconSlot slot, bool on)
@@ -3706,6 +3734,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		else fresh.Slots = _config.Slots;
 		if (_config.TakeDirty()) _configDirty = true;
 		_config = fresh;
+		WindowTheme.Current = fresh.Theme;
 		_neverExpected.Clear();   // the file may mark other ids as required now
 	}
 
@@ -3929,6 +3958,8 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		text.AppendLine($"файл настроек:    {Config.Path}");
 		if (_config.LoadError is not null) text.AppendLine($"                  {_config.LoadError}");
 		if (_config.LoadNote is not null) text.AppendLine($"                  {_config.LoadNote}");
+		var legacyDisks = _config.Icons.Keys.Count(LegacyDiskId);
+		if (legacyDisks > 0) text.AppendLine($"                  старых настроек дисков: {legacyDisks} — не применены; перенесите вручную после проверки серийника");
 		if (_config.ChangedOnDisk) text.AppendLine("                  файл изменён на диске — «Перечитать настройки»");
 		text.AppendLine($"автозапуск:       {(Autostart.IsEnabled ? "включён" : "выключен")}");
 		if (Autostart.PointsElsewhere(out var command))
@@ -4014,7 +4045,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			text.AppendLine("переходы тревог (последние):");
 			foreach (var entry in _journal) text.AppendLine("    " + entry.Line);
 		}
-		TextWindow("TrayMon — диагностика", text.ToString());
+		TextWindow("TrayMon — диагностика", text.ToString(), PublicDiagnostics());
 	}
 
 	/// <summary>
@@ -4187,7 +4218,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 	}
 
 	/// <summary>A read-only window for text worth copying — diagnostics, the summary, a report.</summary>
-	private static void TextWindow(string title, string text)
+	private static void TextWindow(string title, string text, string publicReport = null)
 	{
 		// Declared before the form so it outlives every control that points at it, and is
 		// released on the way out whatever happens inside.
@@ -4215,19 +4246,32 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 			ScrollBars = ScrollBars.Both,
 			WordWrap = false,
 			Font = mono,
-			Text = text.Replace("\n", Environment.NewLine),
+			Text = text.ReplaceLineEndings(Environment.NewLine),
 		};
 		var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, AutoSize = true };
 		var close = new Button { Text = "Закрыть", AutoSize = true, DialogResult = DialogResult.OK };
-		var copy = new Button { Text = "Копировать", AutoSize = true };
-		copy.Click += (_, _) => { try { Clipboard.SetText(box.Text); } catch (Exception) { /* clipboard busy */ } };
+		var copy = new Button { Text = publicReport is null ? "Копировать" : "Копировать полностью", AutoSize = true };
+		var status = new Label { AutoSize = true, Padding = new Padding(0, 8, 0, 0), AccessibleName = "Результат копирования" };
+		copy.Click += (_, _) =>
+		{
+			try { Clipboard.SetText(box.Text); status.Text = "Скопировано"; }
+			catch (Exception) { status.Text = "Буфер занят; повторите копирование"; }
+		};
 		buttons.Controls.Add(close);
 		buttons.Controls.Add(copy);
+		if (publicReport is not null)
+		{
+			var safe = new Button { Text = "Копировать для отчёта…", AutoSize = true };
+			safe.Click += (_, _) => TextWindow("TrayMon — предпросмотр отчёта", publicReport);
+			buttons.Controls.Add(safe);
+		}
+		buttons.Controls.Add(status);
 		layout.Controls.Add(box, 0, 0);
 		layout.Controls.Add(buttons, 0, 1);
 		form.Controls.Add(layout);
 		form.AcceptButton = close;
 		form.CancelButton = close;
+		WindowTheme.Apply(form, WindowTheme.Current);
 		form.ShowDialog();
 	}
 
@@ -4268,6 +4312,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 		form.Controls.Add(layout);
 		form.AcceptButton = ok;
 		form.CancelButton = cancel;
+		WindowTheme.Apply(form, WindowTheme.Current);
 		return form.ShowDialog() == DialogResult.OK ? box.Text.Trim() : null;
 	}
 
@@ -4334,6 +4379,7 @@ internal sealed class TrayApp : ApplicationContext, IGuidStore
 
 			foreach (var slot in _order) slot.Icon?.Dispose();
 			_menu?.Dispose();
+			_sourceMenu?.Dispose();
 			_sync?.Dispose();
 			// Only what this instance built. In the dry run the sensors belong to --once, which
 			// is still using them and disposes them itself.

@@ -42,6 +42,18 @@ public sealed class ReadmeOutputTests
 			    $caught = $true
 			}
 			if (-not $caught) { throw 'Unclosed block silently ignored' }
+			$function = $ast.Find({ param($node)
+			    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+			    $node.Name -eq 'Get-IconLabels'
+			}, $true)
+			. ([scriptblock]::Create($function.Extent.Text))
+			$labels = Get-IconLabels @('icons: 1 shown of 2 known   ticks: 1   errors: 0',
+			    '  on 01 Температура CPU 1: 42 °C; норма',
+			    '  off 31 Том 2: 12 МБ/с; норма')
+			if ('slot Температура CPU' -notin $labels -or 'slot Том' -notin $labels) { throw 'Public metric names lost' }
+			$labels = Get-IconLabels @('icons: 1 shown of 1 known   ticks: 1   errors: 0',
+			    '  on 01 disk.old-id 42 норма Disk')
+			if (-not ($labels | Where-Object { $_ -like '?? *' })) { throw 'Legacy identifiers accepted' }
 			""";
 		var start = new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
 			"WindowsPowerShell", "v1.0", "powershell.exe"))

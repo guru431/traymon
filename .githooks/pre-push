@@ -173,13 +173,20 @@ if [ -f "$sp" ]; then
 fi
 
 suspect=0
-if [ -s "$blobs" ] && git cat-file --batch < "$blobs" 2>/dev/null | tr -d '\000' \
-     | grep -qaE -e "$(scan_generic_pattern)"; then
-  suspect=1
-fi
-if [ "$suspect" -eq 0 ] && [ -s "$blobs" ] && [ -s "$pat" ]; then
-  if git cat-file --batch < "$blobs" 2>/dev/null | tr -d '\000' | grep -qaiEf "$pat"; then
-    suspect=1
+content="$tmpdir/content"
+if [ -s "$blobs" ]; then
+  # Finish the producer before grep can stop early: pipe status otherwise hides
+  # read errors, while pipefail would mistake grep -q's SIGPIPE for a read error.
+  git cat-file --batch < "$blobs" > "$content" 2>"$tmpdir/err" \
+    || die "could not read blob content (--batch): $(tr '\n' ' ' < "$tmpdir/err")"
+  tr -d '\000' < "$content" > "$tmpdir/text" || die "could not decode blob content"
+  rc=0
+  grep -qaE -e "$(scan_generic_pattern)" "$tmpdir/text" || rc=$?
+  case "$rc" in 0) suspect=1 ;; 1) ;; *) die "blob scan failed (rc=$rc)" ;; esac
+  if [ "$suspect" -eq 0 ] && [ -s "$pat" ]; then
+    rc=0
+    grep -qaiEf "$pat" "$tmpdir/text" || rc=$?
+    case "$rc" in 0) suspect=1 ;; 1) ;; *) die "denylist scan failed (rc=$rc)" ;; esac
   fi
 fi
 
@@ -194,7 +201,9 @@ if [ "$suspect" -ne 0 ]; then
     # the same narrow exclusion pre-commit makes. Excluding all of .githooks/
     # meant a concrete token pasted into a hook was published without a word.
     case "$path" in .githooks/_scan.sh) continue ;; esac
-    body=$(git cat-file blob "$sha" 2>/dev/null | tr -d '\000' || true)
+    git cat-file blob "$sha" > "$content" 2>"$tmpdir/err" \
+      || die "could not read blob content ($sha): $(tr '\n' ' ' < "$tmpdir/err")"
+    body=$(tr -d '\000' < "$content") || die "could not decode blob content ($sha)"
     if ! scan_text "$path (blob $sha)" "$body"; then
       fail=1
     fi

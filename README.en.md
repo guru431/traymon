@@ -174,7 +174,7 @@ picking the warning colour by hand used to give a healthy metric the alarm shape
 ## Settings
 
 Right-click any icon. The root menu holds the frequent things — "Настроить этот значок ▸"
-(background colour, digit colour, rename, thresholds, a gigabytes-left threshold for free space,
+(appearance, rename, thresholds, a gigabytes-left threshold for free space,
 the standstill policy for fans, highlight on/off, notify on red, mark as expected), hide this
 icon, the full list of icons grouped and in a stable order, a summary window (also on left click;
 on the summary icon it is ordered by severity), "poll now" — and everything about the installation
@@ -188,9 +188,23 @@ behind the controller and restores SNMP OIDs the agent once refused. The diagnos
 shows what the program's own cycles went to, by source and drawing, as shares — a hint where to
 look; the paired measurement in `docs/measuring.md` is what decides.
 
+**"Оформление…"** groups the background, automatic/light/dark digits, and the window/menu theme.
+It previews the real 16/24/32 px renderer in all four states with contrast ratios. Automatic digits
+choose the stronger sRGB contrast. Cancel discards the draft; Defaults resets only background and ink
+when Apply is pressed, preserving thresholds, captions and GUIDs. Windows high contrast takes priority.
+Native combo boxes, window title bars, colour and message dialogs keep their system appearance.
+
+In the icon list, right-click, the menu key, Shift+F10 or Ctrl+Enter opens the selected source's
+settings without making it visible. The tooltip includes its value, unit, state and device id;
+ordinary checkboxes still keep the list open. The root menu names the value, unit and state.
+
+Diagnostics offers **"Копировать полностью"** for the full local text and **"Копировать для отчёта…"**
+for a preview built from the current snapshot. The preview has a separate copy button and neutral
+metric names; captions, paths, serials, account names and arbitrary error text are omitted. No sensors
+are polled again. Copy success or failure appears in the same window.
+
 **Threshold highlighting overrides the chosen plate colour.** While a value is above the warning
-threshold the icon is yellow or red whatever colour was picked; the program says so when a
-colour is chosen for an icon that is currently highlighted.
+threshold the icon is yellow or red whatever colour was picked; the appearance preview explains this.
 
 **The first run shows three to five icons** — CPU, RAM and the summary icon, plus GPU and VRAM of
 the first card on a machine with an NVIDIA card. The rest are switched on from the menu: seventeen
@@ -198,11 +212,10 @@ icons at once would go straight into the Windows 11 overflow, and the menu lives
 summary icon stands for all the hidden ones:** it turns yellow and red with them, so a UPS asking
 for a new battery or a disk at 60 °C shows in the tray while their own icons are off.
 
-**While the session is locked or the RDP session is disconnected, drawing slows from 2 s to
-30 s.** Nobody can see the icons. The **measurement** schedules do not change with it — they are
-in seconds, not in ticks — so the UPS is still asked every 30 s and the RAID disks every ten
-minutes, and the Windows event-log entries still arrive on time. Those exist precisely for when
-nobody is watching. Returning to the session refreshes everything at once.
+**While the session is locked or RDP is disconnected, the common tick slows from 2 s to 30 s.**
+Source periods stay in milliseconds, but starts and application of results are quantised by the
+current tick. With default settings UPS reads start every 30 s and RAID reads every ten minutes;
+the result may wait another tick. Windows logging remains active. Returning refreshes overdue sources.
 
 Everything is written to `TrayMon.json` next to the executable:
 
@@ -232,10 +245,16 @@ Everything is written to `TrayMon.json` next to the executable:
 ```
 
 Icon ids: `cpu`, `ram`, `cpu.temp`, `gpu.<card key>`, `vram.<card key>`, `gpu.temp.<card key>`,
-`fan.gpu.<card key>`, `disk.<model>` (identical models get a `#2`, `#3` suffix in serial-number
-order), `disk.raid.<serial>` — or `disk.raid.<index>` when the disk reports no serial number —
+`fan.gpu.<card key>`, `disk.<model>@<serial>`, `disk.raid.<serial>` — or `disk.raid.<index>` when the disk reports no serial number —
 `fan.<chip>/<sensor name>`, `net.<adapter description>`, `vol.<drive letter>`,
 `free.<drive letter>`, `ups`, `battery`, `uptime`, `worst`.
+
+Direct-disk serials are uppercased. Removing another drive cannot change an identified drive's
+settings or GUID. Legacy model-only and `#2` entries stay in JSON: they contain no serial proving
+ownership and are never assigned automatically. Select their appearance/thresholds again or transfer
+an entry manually after verifying its serial. Diagnostics counts legacy entries; their required flag
+cannot reserve an identified disk's GUID. Missing or duplicate serials use `<model>@unknown#N`;
+their identity across changes in disk membership is not guaranteed, and they do not share identified keys.
 
 **A card key is the last eight characters of its NVML UUID**, not its index: the index moved when
 a card was added, removed or swapped, and the settings then belonged to a different card. A fan key
@@ -267,11 +286,13 @@ That pair is an instruction, not junk: it is read as `"Alerts": false` and the f
 the current spelling on the next save. Dropping it would switch the highlight back on for icons
 somebody had deliberately silenced.
 
-- `TickMs` — the **drawing** interval, upwards only: anything below 2000 is refused. Measurement
-  periods are separate and in seconds, so raising it makes the program cheaper without pushing
-  detection of a real problem beyond one tick. The freshness limit of background data counts from
-  the longer of the period and the tick — above 42 s the CPU temperature and the fans used to be
-  never fresh at all.
+- `TickMs` — the common tick interval (2000–60000 ms), used both to start readers and apply results.
+  Source periods remain separate, but starts round up to a tick: a 62 s period becomes about 120 s
+  at a 60 s tick. A completed background snapshot may wait another tick before being applied.
+  Detection latency includes the source period, start quantisation, reading duration and application
+  delay; there is no one-tick upper bound. Freshness is 2 × max(source period, current tick) + 30 s.
+- `Theme` — `light`, `dark` or `null` (system colours), shared by windows and menus. Windows high
+  contrast takes priority; native colour and message dialogs use the system theme.
 - `Net.NotPhysical` — **a custom list replaces the built-in one entirely**, which is why it is
   spelled out in full above. `Net.Include` is the way to keep a VPN or a virtual adapter you do
   watch without rewriting that list; `Net.Bandwidth` gives the percentage a figure to divide by
@@ -551,8 +572,9 @@ looks exactly like the broken registration those counters exist to catch. Read t
 diagnostics window of a running program, where about 1.5 calls per tick across the whole tray
 is normal.
 
-`--once` output is deliberately anonymised — no absolute paths, no SNMP address, no disk
-serial numbers — because people paste it into public issue trackers. The full picture is in
+`--once` output replaces known absolute paths, the SNMP address and disk serials; `--icons` omits
+custom captions and free-form slot details, reporting neutral names, GUID suffixes, values, units,
+levels and snapshot ages. People paste it into public issue trackers. The full picture is in
 the "Диагностика…" (diagnostics) menu item, which stays on the machine.
 
 ## Uninstalling

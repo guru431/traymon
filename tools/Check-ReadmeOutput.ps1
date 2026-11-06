@@ -151,13 +151,6 @@ if (-not $failed) { Write-Host "`nПример --once в README совпадае
 # обе стороны. Слоты — только в одну: пример в README намеренно короткий, но каждое семейство в нём
 # обязано существовать в выводе (или быть железом, которого на этой машине может не быть), —
 # так ловится идентификатор старой схемы вроде `disk.0`.
-function Get-Family([string]$id) {
-    foreach ($prefix in 'gpu.temp.', 'fan.gpu.', 'disk.raid.', 'gpu.', 'vram.', 'disk.', 'fan.', 'net.', 'vol.', 'free.') {
-        if ($id.StartsWith($prefix)) { return "$prefix*" }
-    }
-    return $id
-}
-
 function Get-IconLabels([string[]]$lines) {
     $labels = @()
     $started = $false
@@ -169,7 +162,7 @@ function Get-IconLabels([string[]]$lines) {
         }
         if ($line -match '^\s*tick \d+:') { $labels += 'tick N:'; continue }
         if ($line -match '^icons: ') { $labels += (($line -replace '\d+', 'N') -replace '\s+', ' ').Trim(); continue }
-        if ($line -match '^\s+(on|off)\s+[0-9A-Fa-f]{2}\s+(\S+)') { $labels += 'slot ' + (Get-Family $Matches[2]); continue }
+        if ($line -match '^\s+(on|off)\s+[0-9A-Fa-f]{2}\s+(.+?)\s+\d+:\s+') { $labels += 'slot ' + $Matches[2]; continue }
         if ($line -match '^shell not touched') { $labels += 'shell not touched'; continue }
         if ($line -match '^tick [\d.]+ ms') { $labels += 'tick N ms'; continue }
         if ($line -match '^\s+last error:') { $labels += 'last error'; continue }
@@ -195,8 +188,8 @@ if (-not $iconsExample) { throw "В $Readme нет блока с примеро�
 $fromCode = Get-IconLabels $iconsOutput
 $fromDocs = Get-IconLabels $iconsExample
 $optionalKinds = @('tick N:', 'last error', 'overflow')
-$optionalFamilies = @('gpu.*', 'vram.*', 'gpu.temp.*', 'fan.gpu.*', 'disk.*', 'disk.raid.*', 'fan.*',
-                      'net.*', 'vol.*', 'free.*', 'cpu.temp', 'ups', 'battery')
+$optionalFamilies = @('GPU', 'VRAM', 'Температура GPU', 'Вентилятор GPU', 'Диск', 'Диск за RAID', 'Вентилятор',
+                      'Сеть', 'Том', 'Свободно', 'Температура CPU', 'ИБП', 'Батарея')
 
 $missing = $fromCode | Where-Object {
     $_ -notlike 'slot *' -and $_ -notlike '?? *' -and $_ -notin $fromDocs -and $_ -notin $optionalKinds

@@ -540,26 +540,35 @@ public sealed class DiskKeyTests
 		new(model, 40, null, null) { Serial = serial };
 
 	[Fact]
-	public void IdenticalModelsAreOrderedBySerial()
+	public void IdenticalModelsKeepTheirSerialKeysAcrossReordering()
 	{
 		var forwards = TrayApp.DiskKeys(new List<DiskReading>
 			{ Disk("WDC WD10", "SN-B"), Disk("WDC WD10", "SN-A") });
 		var backwards = TrayApp.DiskKeys(new List<DiskReading>
 			{ Disk("WDC WD10", "SN-A"), Disk("WDC WD10", "SN-B") });
 
-		// SN-A is the plain model, SN-B is #2, whichever order they were enumerated in.
-		Assert.Equal("WDC WD10#2", forwards[0]);
-		Assert.Equal("WDC WD10", forwards[1]);
-		Assert.Equal("WDC WD10", backwards[0]);
-		Assert.Equal("WDC WD10#2", backwards[1]);
+		Assert.Equal("WDC WD10@SN-B", forwards[0]);
+		Assert.Equal("WDC WD10@SN-A", forwards[1]);
+		Assert.Equal("WDC WD10@SN-A", backwards[0]);
+		Assert.Equal("WDC WD10@SN-B", backwards[1]);
 	}
 
 	[Fact]
-	public void DifferentModelsKeepTheirNames()
+	public void DifferentModelsIncludeTheirHardwareIdentity()
 	{
 		var keys = TrayApp.DiskKeys(new List<DiskReading>
 			{ Disk("Samsung 990", "S1"), Disk("WDC WD10", "S2") });
-		Assert.Equal(new[] { "Samsung 990", "WDC WD10" }, keys);
+		Assert.Equal(new[] { "Samsung 990@S1", "WDC WD10@S2" }, keys);
+	}
+
+	[Fact]
+	public void MissingOrDuplicateSerialsStayOutsideIdentifiedKeys()
+	{
+		var keys = TrayApp.DiskKeys(new List<DiskReading>
+			{ Disk("Model", "A"), Disk("Model", " A "), Disk("Model", null), Disk("Model", "B") });
+		Assert.Equal(4, keys.Distinct().Count());
+		Assert.All(keys.Take(3), key => Assert.Contains("@unknown#", key));
+		Assert.Equal("Model@B", keys[3]);
 	}
 }
 

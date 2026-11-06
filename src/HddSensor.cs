@@ -43,6 +43,7 @@ public sealed class HddSensor
 	private List<(string Device, string Type)> _devices;
 	private long _discoveredAt;
 	private bool? _safe;
+	private int _rediscover;
 
 	/// <summary>Each device's last answer while it was awake, so a disk found asleep can still be
 	/// named. Only ever touched by the one reader thread the refresh flag allows.</summary>
@@ -95,6 +96,7 @@ public sealed class HddSensor
 	/// </summary>
 	public List<RaidDisk> ReadAll()
 	{
+		if (Interlocked.Exchange(ref _rediscover, 0) != 0) _devices = null;
 		var disks = new List<RaidDisk>();
 		if (!Available)
 		{
@@ -214,7 +216,7 @@ public sealed class HddSensor
 	/// Forgets the device list, so the next read scans again. "Опросить датчики сейчас" exists for
 	/// the moment right after the hardware changed, which is exactly when a cached list is wrong.
 	/// </summary>
-	public void Rediscover() => _devices = null;
+	public void Rediscover() => Interlocked.Exchange(ref _rediscover, 1);
 
 	/// <summary>Where the tool is weakly protected but is started anyway — see <see cref="Safe"/>.
 	/// Shown by the diagnostics window and by <c>--once</c>.</summary>
@@ -240,17 +242,18 @@ public sealed class HddSensor
 	private bool Safe()
 	{
 		if (_safe.HasValue) return _safe.Value;
-		var protectedFolder = !Autostart.WritableByNonAdmins(AppContext.BaseDirectory, out _);
-		if (Autostart.UnsafeToRun(_exe, out var who))
+		var install = Autostart.CheckFolder(AppContext.BaseDirectory);
+		var target = Autostart.CheckFile(_exe);
+		var refusal = Autostart.ExternalRefusal(install, target);
+		if (refusal is not null)
 		{
-			if (protectedFolder)
-			{
-				_safe = false;
-				LastError = "smartctl.exe не запущен: он вне защищённой папки программы, и его может " +
-							"подменить " + who + ", а TrayMon работает с правами администратора";
-				return false;
-			}
-			Note = "smartctl.exe запускается из папки, доступной на запись (" + who + "). " +
+			if (install.Error is null && target.Error is null) _safe = false;
+			LastError = "smartctl.exe не запущен: " + refusal;
+			return false;
+		}
+		if (target.Writable || target.Error is not null)
+		{
+			Note = "smartctl.exe запускается из папки, доступной на запись (" + (target.Who ?? "права инструмента не проверены") + "). " +
 				   "TrayMon работает с правами администратора, поэтому подменённый файл получил бы их же — " +
 				   "но то же верно и для самого TrayMon.exe рядом с ним";
 		}

@@ -27,6 +27,9 @@ public sealed record GpuReading(
 	public int MemCode { get; init; }
 
 	public int TempCode { get; init; }
+
+	/// <summary>At least one channel has zero RPM and its own nonzero duty request.</summary>
+	public bool DrivenFanStopped { get; init; }
 }
 
 /// <summary>
@@ -51,9 +54,8 @@ public sealed record RaidDisk(string Name, double? Temp, string Serial, string H
 public sealed record DiskReading(string Name, double Temp, double? WearPercent, double? SparePercent)
 {
 	/// <summary>
-	/// Serial number, where the storage driver supplied one. Not used as the icon id — that stays
-	/// the model, which is what a person reads in the settings file — but it is what tells two
-	/// identical models apart, so their ordinal suffixes stop swapping between reboots.
+	/// Serial number, where the storage driver supplied one. Together with the model it forms
+	/// the icon key; an ordinal alone cannot identify an owner when another disk disappears.
 	/// </summary>
 	public string Serial { get; init; }
 
@@ -113,7 +115,7 @@ public sealed class UpsReading
 	public double? Charge;         // % of battery capacity
 	public double? RunTimeMin;     // minutes left on battery
 	public double? Load;           // % of the rated load of the UPS
-	public bool NeedsNewBattery;
+	public bool? NeedsNewBattery;
 
 	/// <summary>Raw upsBasicOutputStatus; null when the agent did not carry the OID.</summary>
 	public int? Status;
@@ -130,11 +132,11 @@ public sealed class UpsReading
 	/// sent "ИБП перешёл на батарею" with an Error event into the log a server's monitoring reads,
 	/// and "Питание от сети восстановлено" one poll later, for a mains that had never gone.
 	/// </remarks>
-	public bool? OnBattery => Status switch { 3 => true, null or 1 => null, _ => false };
+	public bool? OnBattery => Status switch { 3 => true, >= 2 and <= 17 => false, _ => null };
 
 	/// <summary>The load is going through a bypass instead of the inverter: the UPS will not carry
 	/// it through the next outage.</summary>
-	public bool Bypass => Status is 6 or 9 or 10 or 16 or 17;
+	public bool? Bypass => Status switch { 6 or 9 or 10 or 16 or 17 => true, >= 2 and <= 17 => false, _ => null };
 
 	/// <summary>
 	/// Working, but not the way it should be: AVR trimming or boosting the mains, or the load
@@ -413,6 +415,18 @@ public sealed class GpuSensor : IDisposable
 	/// the driver afterwards.
 	/// </summary>
 	private long _retryAt;
+	private readonly Func<List<GpuReading>> _poll;
+	private readonly Action _restart;
+	private readonly Func<long> _now;
+	private readonly bool _ownsLibrary;
+
+	internal GpuSensor(Func<List<GpuReading>> poll, Action restart, Func<long> now)
+	{
+		_poll = poll;
+		_restart = restart;
+		_now = now;
+		_ready = true;
+	}
 
 	/// <summary>Why NVML did not come up; shown by --once and by the diagnostics window.</summary>
 	public string LastError { get; private set; }
@@ -457,6 +471,10 @@ public sealed class GpuSensor : IDisposable
 
 	public GpuSensor()
 	{
+		_ownsLibrary = true;
+		_poll = ReadCards;
+		_restart = Reinit;
+		_now = () => Environment.TickCount64;
 		// Everything: a driver too old for nvmlInit_v2 throws EntryPointNotFound, a 32-bit
 		// nvml.dll on PATH throws BadImageFormat, and this runs in a field initialiser of
 		// TrayApp — an escaping exception there stops the program from starting at all.
@@ -577,25 +595,20 @@ public sealed class GpuSensor : IDisposable
 		{
 			// Not ready and past the cool-down: the driver may have come back since. No condition
 			// on the error streak — see _retryAt.
-			if (Environment.TickCount64 >= _retryAt) Reinit();
+			if (_now() >= _retryAt) Restart();
 			if (!_ready) { r.Gpus = new List<GpuReading>(); return; }
 		}
 		try
 		{
-			var cards = new List<GpuReading>(_cards.Count);
-			var lost = 0;
-			foreach (var card in _cards)
-			{
-				cards.Add(ReadCard(card, out var rc));
-				if (rc != 0) lost++;
-			}
+			var cards = _poll();
+			var lost = cards.Count(g => g.LoadCode != 0 && g.MemCode != 0 && g.TempCode != 0);
 			r.Gpus = cards;
 
-			// Three polls in a row where not one card answered is a driver that has been reset or
-			// replaced, not a busy moment. Handles do not recover on their own.
-			if (lost == _cards.Count && _cards.Count > 0) _lostStreak++;
+			// Even one lost handle needs enumeration again. A healthy neighbour does not
+			// repair it. The shared cooldown still limits restarts to once a minute.
+			if (lost > 0 || cards.Count == 0) _lostStreak++;
 			else { _lostStreak = 0; LastError = null; }
-			if (_lostStreak >= 3 && Environment.TickCount64 >= _retryAt) Reinit();
+			if (_lostStreak >= 3 && _now() >= _retryAt) Restart();
 		}
 		catch (Exception ex)
 		{
@@ -609,24 +622,34 @@ public sealed class GpuSensor : IDisposable
 			// The same path as a run of error codes. An exception used to bypass the Reinit call,
 			// which sat inside the try block it had just left, so a driver that throws instead of
 			// returning a code was never recovered from.
-			if (_lostStreak >= 3 && Environment.TickCount64 >= _retryAt) Reinit();
+			if (_lostStreak >= 3 && _now() >= _retryAt) Restart();
 		}
 	}
 
-	/// <param name="status">0 when the card answered at least one of utilization, memory and
-	/// temperature; otherwise the utilization error code.</param>
-	private GpuReading ReadCard(Card card, out int status)
+	private void Restart()
+	{
+		_retryAt = _now() + ReinitEveryMs;
+		_restart();
+	}
+
+	private List<GpuReading> ReadCards()
+	{
+		var readings = new List<GpuReading>(_cards.Count);
+		foreach (var card in _cards) readings.Add(ReadCard(card));
+		return readings;
+	}
+
+	private GpuReading ReadCard(Card card)
 	{
 		double? load = null, temp = null, memLoad = null, fanRpm = null, fanDuty = null;
 		double usedGb = 0, totalGb = 0;
 
-		status = NvmlGetUtilization(card.Handle, out var util);
-		var utilRc = status;
-		if (status == 0) load = util.Gpu;
-		else if (status is NvmlGpuIsLost or NvmlUninitialized or NvmlUnknown)
+		var utilRc = NvmlGetUtilization(card.Handle, out var util);
+		if (utilRc == 0) load = util.Gpu;
+		else if (utilRc is NvmlGpuIsLost or NvmlUninitialized or NvmlUnknown)
 			// "No NVIDIA driver" is what the icon used to say here, and it was wrong in the one
 			// case that matters: the driver is there, the card is not.
-			LastError = "NVML: карта не отвечает (код " + status + ")";
+			LastError = "NVML: карта не отвечает (код " + utilRc + ")";
 
 		var memRc = NvmlGetMemory(card.Handle, out var mem);
 		if (memRc == 0 && mem.Total > 0)
@@ -639,12 +662,6 @@ public sealed class GpuSensor : IDisposable
 		var tempRc = NvmlGetTemperature(card.Handle, 0 /* NVML_TEMPERATURE_GPU */, out var t);
 		if (tempRc == 0) temp = t;
 
-		// A card that answers anything has not been lost. Utilization alone decided it, so a card
-		// that does not report utilization at all, or a busy driver returning 999 for it three polls
-		// running, had NVML torn down and brought back under memory and temperature that were
-		// reading fine.
-		if (memRc == 0 || tempRc == 0) status = 0;
-
 		// Prefer real RPM; older drivers only expose the duty cycle. A successful call reporting
 		// zero means the fan has stopped — which is the whole point of the fan icon — so it must
 		// not be mistaken for "this driver cannot answer": every card with a zero-RPM idle mode
@@ -654,11 +671,13 @@ public sealed class GpuSensor : IDisposable
 		// Every fan of the card, not fan 0: on a three-fan card one stopped fan is the failure
 		// worth an icon, and reading only the first one hid it completely. The slowest wins, for
 		// the same reason.
-		if (card.FanRpmSupported)
+		var drivenFanStopped = false;
+		for (var fan = 0u; fan < card.Fans; fan++)
 		{
-			try
+			double? rpm = null, requested = null;
+			if (card.FanRpmSupported)
 			{
-				for (var fan = 0u; fan < card.Fans; fan++)
+				try
 				{
 					var info = new NvmlFanSpeedInfo
 					{
@@ -666,15 +685,16 @@ public sealed class GpuSensor : IDisposable
 						Fan = fan,
 					};
 					var rc = NvmlGetFanRpm(card.Handle, ref info);
-					if (rc == 0) fanRpm = fanRpm.HasValue ? Math.Min(fanRpm.Value, info.Speed) : info.Speed;
-					else if (rc is NvmlNotSupported or NvmlFunctionNotFound) { card.FanRpmSupported = false; break; }
+					if (rc == 0) rpm = info.Speed;
+					else if (rc is NvmlNotSupported or NvmlFunctionNotFound) card.FanRpmSupported = false;
 				}
+				catch (EntryPointNotFoundException) { card.FanRpmSupported = false; }
 			}
-			catch (EntryPointNotFoundException) { card.FanRpmSupported = false; }
+			if (NvmlGetFanDuty(card.Handle, fan, out var duty) == 0) requested = duty;
+			if (rpm.HasValue) fanRpm = fanRpm.HasValue ? Math.Min(fanRpm.Value, rpm.Value) : rpm;
+			if (requested.HasValue) fanDuty = fanDuty.HasValue ? Math.Max(fanDuty.Value, requested.Value) : requested;
+			drivenFanStopped |= DrivenStop(rpm, requested);
 		}
-		for (var fan = 0u; fan < card.Fans; fan++)
-			if (NvmlGetFanDuty(card.Handle, fan, out var duty) == 0)
-				fanDuty = fanDuty.HasValue ? Math.Max(fanDuty.Value, duty) : duty;
 
 		return new GpuReading(card.Index, card.Name, load, temp, fanRpm, fanDuty, memLoad, usedGb, totalGb)
 		{
@@ -682,12 +702,15 @@ public sealed class GpuSensor : IDisposable
 			LoadCode = load.HasValue ? 0 : utilRc,
 			MemCode = memLoad.HasValue ? 0 : memRc == 0 ? NvmlUnknown : memRc,
 			TempCode = tempRc,
+			DrivenFanStopped = drivenFanStopped,
 		};
 	}
 
+	internal static bool DrivenStop(double? rpm, double? duty) => rpm == 0 && duty > 0;
+
 	public void Dispose()
 	{
-		if (_ready) Release();
+		if (_ready && _ownsLibrary) Release();
 		_ready = false;
 	}
 }

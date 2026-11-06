@@ -188,5 +188,37 @@ rc=0
 printf '%s' "$output" | grep -q 'cannot determine the repository root' || rc=$?
 check "scanner: an unresolved repository root has a specific diagnostic" 0 "$rc"
 
+# A successful enumeration says nothing about whether blob contents can be read.
+# The shim fails only the content operation, leaving rev-list and batch-check real.
+real_git=$(command -v git)
+mkdir -p "$repo/fakebin"
+cat > "$repo/fakebin/git" <<'SHIM'
+#!/bin/sh
+if [ "$1" = cat-file ] && [ "$2" = "$FAIL_CONTENT" ]; then
+  printf '%s\n' 'incomplete content'
+  exit 70
+fi
+exec "$REAL_GIT" "$@"
+SHIM
+chmod +x "$repo/fakebin/git"
+for operation in --batch blob; do
+  # Force the precise pass for the second case; do not rely on the final verdict
+  # (a real secret would also refuse). Check the content-read diagnostic as well.
+  if [ "$operation" = blob ]; then
+    echo "$token" > "$repo/content.txt"
+    git -C "$repo" add content.txt
+    git -C "$repo" -c core.hooksPath= commit -qm 'content fixture'
+    head=$(git -C "$repo" rev-parse HEAD)
+  fi
+  rc=0
+  output=$(printf 'refs/heads/main %s refs/heads/main %s\n' "$head" "$zero" \
+    | ( cd "$repo" && PATH="$repo/fakebin:$PATH" REAL_GIT="$real_git" FAIL_CONTENT="$operation" \
+        sh "$hooks/pre-push" origin https://example.invalid/x.git ) 2>&1) || rc=$?
+  check "pre-push: failed cat-file $operation refuses publication" 1 "$rc"
+  rc=0
+  printf '%s' "$output" | grep -q 'could not read blob content' || rc=$?
+  check "pre-push: failed cat-file $operation reports the read failure" 0 "$rc"
+done
+
 echo "passed $passed, failed $failed"
 [ "$failed" -eq 0 ]

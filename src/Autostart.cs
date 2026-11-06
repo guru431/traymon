@@ -498,7 +498,31 @@ internal static class Autostart
 	/// — but a security check that quietly did not happen must at least be visible, so this is
 	/// shown in the diagnostics window and next to the confirmation.
 	/// </summary>
+	[field: ThreadStatic]
 	public static string LastCheckError { get; private set; }
+
+	internal readonly record struct PathCheck(bool Writable, string Who, string Error);
+
+	internal static PathCheck CheckFolder(string path)
+	{
+		var writable = WritableByNonAdmins(path, out var who);
+		return new(writable, who, LastCheckError);
+	}
+
+	internal static PathCheck CheckFile(string path)
+	{
+		var writable = UnsafeToRun(path, out var who);
+		return new(writable, who, LastCheckError);
+	}
+
+	/// <summary>Unknown permissions never establish the deliberate writable-install exception.</summary>
+	internal static string ExternalRefusal(PathCheck install, PathCheck target)
+	{
+		if (install.Writable) return null;
+		if (install.Error is not null) return "не удалось проверить папку программы: " + install.Error;
+		if (target.Error is not null) return "не удалось проверить внешний путь: " + target.Error;
+		return target.Writable ? "внешний путь может изменить " + target.Who : null;
+	}
 
 	/// <summary>Rights on the folder itself that let somebody replace what is in it.</summary>
 	private const FileSystemRights DangerousHere =

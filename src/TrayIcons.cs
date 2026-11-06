@@ -41,7 +41,7 @@ internal static class CycleClock
 /// </summary>
 public sealed class TrayValueIcon : IDisposable
 {
-	private const int NIM_ADD = 0, NIM_MODIFY = 1, NIM_DELETE = 2, NIM_SETVERSION = 4;
+	private const int NIM_ADD = 0, NIM_MODIFY = 1, NIM_DELETE = 2, NIM_SETFOCUS = 3, NIM_SETVERSION = 4;
 	private const int NIF_MESSAGE = 0x01, NIF_ICON = 0x02, NIF_TIP = 0x04, NIF_INFO = 0x10,
 					  NIF_GUID = 0x20, NIF_SHOWTIP = 0x80;
 	private const int NIIF_INFO = 0x01, NIIF_WARNING = 0x02;
@@ -144,6 +144,29 @@ public sealed class TrayValueIcon : IDisposable
 	[DllImport("user32.dll")]
 	private static extern bool SetForegroundWindow(IntPtr hWnd);
 
+	[StructLayout(LayoutKind.Sequential)]
+	private struct IconIdentifier
+	{
+		public uint Size;
+		public IntPtr Window;
+		public uint Id;
+		public Guid Guid;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	private struct NativeRect { public int Left, Top, Right, Bottom; }
+
+	[DllImport("shell32.dll")]
+	private static extern int Shell_NotifyIconGetRect(ref IconIdentifier identifier, out NativeRect rect);
+	[DllImport("user32.dll")]
+	private static extern IntPtr WindowFromPoint(Point point);
+	[DllImport("user32.dll", CharSet = CharSet.Unicode)]
+	private static extern IntPtr FindWindow(string className, string title);
+	[DllImport("user32.dll")]
+	private static extern uint GetDpiForWindow(IntPtr window);
+	[DllImport("user32.dll")]
+	private static extern int GetSystemMetricsForDpi(int index, uint dpi);
+
 	[DllImport("user32.dll", CharSet = CharSet.Unicode)]
 	private static extern int RegisterWindowMessage(string name);
 
@@ -158,9 +181,9 @@ public sealed class TrayValueIcon : IDisposable
 	/// </summary>
 	private static readonly int WmTaskbarCreated = RegisterWindowMessage("TaskbarCreated");
 
-	private static readonly Color WarnPlate = Color.FromArgb(214, 170, 0);
-	private static readonly Color CritPlate = Color.FromArgb(196, 48, 32);
-	private static readonly Color DeadPlate = Color.FromArgb(70, 70, 70);
+	internal static readonly Color WarnPlate = Color.FromArgb(214, 170, 0);
+	internal static readonly Color CritPlate = Color.FromArgb(196, 48, 32);
+	internal static readonly Color DeadPlate = Color.FromArgb(70, 70, 70);
 
 	private readonly MessageWindow _window;
 	private readonly Action<TrayValueIcon> _onRightClick;
@@ -192,6 +215,8 @@ public sealed class TrayValueIcon : IDisposable
 	private Bitmap _canvas;
 	private Graphics _canvasGraphics;
 	private int _side;
+	private int _requestedSide;
+	private Point? _callbackPoint;
 
 	/// <param name="onRightClick">Called when the user right-clicks this icon; the owner builds
 	/// a menu for whichever icon was clicked.</param>
@@ -274,7 +299,8 @@ public sealed class TrayValueIcon : IDisposable
 		if (_checkSize)
 		{
 			_checkSize = false;
-			if (Math.Max(16, SystemInformation.SmallIconSize.Height) != _side) _forceRedraw = true;
+			_requestedSide = TargetSide();
+			if (_requestedSide != _side) _forceRedraw = true;
 		}
 		_level = level;
 		var color = _level switch
@@ -405,6 +431,7 @@ public sealed class TrayValueIcon : IDisposable
 		var version = NewData();
 		version.uVersion = NOTIFYICON_VERSION_4;
 		_version4 = Shell_NotifyIcon(NIM_SETVERSION, ref version);
+		_checkSize = true;
 	}
 
 	private NotifyIconData NewData() => new()
@@ -424,8 +451,39 @@ public sealed class TrayValueIcon : IDisposable
 	/// <summary>Brings the hidden window forward so the menu closes when focus is lost.</summary>
 	public void PrepareMenu() => SetForegroundWindow(_window.Handle);
 
-	private void OnTrayMessage(int notification)
+	public Point MenuPosition => TryRect(out var rect) ? new Point(rect.Left, rect.Top)
+		: _callbackPoint ?? Cursor.Position;
+
+	public void ReturnFocus()
 	{
+		if (!_added) return;
+		var data = NewData();
+		data.uFlags = _useGuid ? NIF_GUID : 0;
+		Shell_NotifyIcon(NIM_SETFOCUS, ref data);
+	}
+
+	private bool TryRect(out NativeRect rect)
+	{
+		var id = new IconIdentifier { Size = (uint)Marshal.SizeOf<IconIdentifier>(), Window = _window.Handle,
+			Id = 1, Guid = _useGuid ? _guid : Guid.Empty };
+		return Shell_NotifyIconGetRect(ref id, out rect) == 0;
+	}
+
+	private int TargetSide()
+	{
+		var window = TryRect(out var rect)
+			? WindowFromPoint(new Point((rect.Left + rect.Right) / 2, (rect.Top + rect.Bottom) / 2))
+			: FindWindow("Shell_TrayWnd", null);
+		var dpi = GetDpiForWindow(window);
+		return Math.Max(16, GetSystemMetricsForDpi(50 /* SM_CYSMICON */, dpi == 0 ? 96u : dpi));
+	}
+
+	internal static Point CallbackPoint(IntPtr packed) =>
+		new(unchecked((short)(packed.ToInt64() & 0xffff)), unchecked((short)((packed.ToInt64() >> 16) & 0xffff)));
+
+	private void OnTrayMessage(int notification, IntPtr coordinates)
+	{
+		_callbackPoint = _version4 && coordinates.ToInt64() != -1 ? CallbackPoint(coordinates) : null;
 		switch (notification)
 		{
 			case WM_CONTEXTMENU:
@@ -471,6 +529,7 @@ public sealed class TrayValueIcon : IDisposable
 		_timeouts = 0;
 		_retryAt = 0;
 		_forceRedraw = true;
+		_checkSize = true;
 		Update(_lastDrawn, _level, _lastTip);
 	}
 
@@ -508,7 +567,7 @@ public sealed class TrayValueIcon : IDisposable
 	private IntPtr Draw(string text, Color plate, int level)
 	{
 		// Draw at the size Windows actually asks for, so nothing is rescaled on high-DPI screens.
-		var side = Math.Max(16, SystemInformation.SmallIconSize.Height);
+		var side = _requestedSide == 0 ? _requestedSide = TargetSide() : _requestedSide;
 		if (_canvas is null || side != _side)
 		{
 			_canvasGraphics?.Dispose();
@@ -518,12 +577,18 @@ public sealed class TrayValueIcon : IDisposable
 			_canvasGraphics = Graphics.FromImage(_canvas);
 		}
 
-		var g = _canvasGraphics;
+		PaintIcon(_canvasGraphics, side, text, plate, _ink, level);
+		return _canvas.GetHicon();
+	}
+
+	/// <summary>The tray and the appearance preview use exactly the same pixel renderer.</summary>
+	internal static void PaintIcon(Graphics g, int side, string text, Color plate, Color? requestedInk, int level)
+	{
 		g.Clear(Color.Transparent);
 		g.SmoothingMode = SmoothingMode.AntiAlias;
 		g.FillPath(Ink(plate), Outline(side));
 
-		var ink = _ink ?? (Luma(plate) > 140 ? Color.Black : Color.White);
+		var ink = requestedInk ?? AutoInk(plate);
 		var brush = Ink(ink);
 
 		// A second channel for the alarm, driven by the level and not by the RGB that came out of
@@ -543,7 +608,6 @@ public sealed class TrayValueIcon : IDisposable
 		var step = text.Length > 4 ? 3 : text.Length > 3 ? 2 : text.Length > 2 ? 1 : 0;
 		g.DrawString(text, Digit(side, step), brush, new RectangleF(0, 0, side, side), Centered);
 
-		return _canvas.GetHicon();
 	}
 
 	/// <summary>A small triangle in a corner: the shape that says "alarm" without a colour.</summary>
@@ -556,7 +620,33 @@ public sealed class TrayValueIcon : IDisposable
 		g.FillPolygon(brush, points);
 	}
 
-	private static double Luma(Color c) => 0.299 * c.R + 0.587 * c.G + 0.114 * c.B;
+	private static readonly Dictionary<Color, Color> AutomaticInks = new();
+
+	internal static double Luminance(Color color)
+	{
+		static double Linear(byte channel)
+		{
+			var c = channel / 255.0;
+			return c <= 0.04045 ? c / 12.92 : Math.Pow((c + 0.055) / 1.055, 2.4);
+		}
+		return 0.2126 * Linear(color.R) + 0.7152 * Linear(color.G) + 0.0722 * Linear(color.B);
+	}
+
+	internal static double Contrast(Color a, Color b)
+	{
+		var x = Luminance(a);
+		var y = Luminance(b);
+		return (Math.Max(x, y) + 0.05) / (Math.Min(x, y) + 0.05);
+	}
+
+	internal static Color AutoInk(Color plate)
+	{
+		if (AutomaticInks.TryGetValue(plate, out var ink)) return ink;
+		var luminance = Luminance(plate);
+		ink = (luminance + 0.05) / 0.05 >= 1.05 / (luminance + 0.05) ? Color.Black : Color.White;
+		if (AutomaticInks.Count > 64) AutomaticInks.Clear();
+		return AutomaticInks[plate] = ink;
+	}
 
 	private static SolidBrush Ink(Color color)
 	{
@@ -625,7 +715,7 @@ public sealed class TrayValueIcon : IDisposable
 		{
 			if (m.Msg == WM_TRAYCALLBACK)
 			{
-				_owner.OnTrayMessage((int)m.LParam & 0xFFFF);
+				_owner.OnTrayMessage((int)m.LParam & 0xFFFF, m.WParam);
 				return;
 			}
 			if (WmTaskbarCreated != 0 && m.Msg == WmTaskbarCreated)
