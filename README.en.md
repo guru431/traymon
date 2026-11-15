@@ -310,7 +310,7 @@ somebody had deliberately silenced.
 - `Tools.SmartctlScan` — a scan and nothing else: `--scan` or `--scan-open` with `-d TYPE`
   (`-d megaraid,N`, `-d aacraid,...` for LSI and Adaptec). It goes onto the command line of an
   elevated process, so anything else is dropped — CSMI applies, with a note in «Диагностика…»
-  and `--once`.
+  and `--once`. The corrected scan is persisted on the next settings save.
 - `Sensors.UseSensorDriver` — `false` keeps LibreHardwareMonitor, and the WinRing0 driver it
   loads, unopened. CPU temperature, motherboard fans and NVMe wear then have no source and say so.
 - `Log` — `time;id;value;unit;severity;status;measured_at`, one row per icon. The raw number in a

@@ -65,6 +65,7 @@ internal sealed class AppearanceDialog : Form
 		var apply = new Button { Text = "Применить", AutoSize = true, DialogResult = DialogResult.OK };
 		var cancel = new Button { Text = "Отмена", AutoSize = true, DialogResult = DialogResult.Cancel };
 		var reset = new Button { Text = "По умолчанию", AutoSize = true };
+		// Reset this icon's colours; the window theme belongs to the whole application.
 		reset.Click += (_, _) => { _plate = _defaultPlate; _defaultColor = true; _ink.SelectedIndex = 0; RefreshPreview(); };
 		buttons.Controls.AddRange(new Control[] { apply, cancel, reset });
 		layout.Controls.Add(buttons);

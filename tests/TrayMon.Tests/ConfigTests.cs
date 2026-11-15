@@ -530,6 +530,13 @@ public sealed class ConfigTests : IDisposable
 		Assert.Null(config.LoadError);
 		Assert.Contains("Tools.SmartctlScan", config.LoadNote);
 		Assert.Equal("--scan-open -d csmi", config.Tools.SmartctlScan);
+		Assert.True(config.TakeDirty());
+		Assert.False(config.TakeDirty());
+		Assert.True(config.Save(out var error), error);
+		var saved = Config.Read();
+		Assert.Null(saved.LoadNote);
+		Assert.Equal(ToolSettings.DefaultScan, saved.Tools.SmartctlScan);
+		Assert.False(saved.TakeDirty());
 	}
 
 	[Theory]

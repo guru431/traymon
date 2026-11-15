@@ -76,6 +76,26 @@ public sealed class SnmpParserTests
 
 	// ---- what a good answer must do ----
 
+	[Theory]
+	[InlineData("0.39.3", new byte[] { 0x06, 2, 0x27, 3 })]
+	[InlineData("1.39.3", new byte[] { 0x06, 2, 0x4F, 3 })]
+	[InlineData("2.100.3", new byte[] { 0x06, 3, 0x81, 0x34, 3 })]
+	[InlineData("2.4294967295.3", new byte[] { 0x06, 6, 0x90, 0x80, 0x80, 0x80, 0x4F, 3 })]
+	public void EncodesTheCombinedFirstTwoOidArcs(string oid, byte[] expected) =>
+		Assert.Equal(expected, UpsSensor.EncodeOid(oid));
+
+	[Theory]
+	[InlineData("3.0")]
+	[InlineData("0.40")]
+	[InlineData("1.40")]
+	[InlineData("1")]
+	[InlineData("")]
+	[InlineData(null)]
+	[InlineData("2.-1")]
+	[InlineData("2.4294967296")]
+	public void InvalidOidRootsAreRefused(string oid) =>
+		Assert.Throws<FormatException>(() => UpsSensor.EncodeOid(oid));
+
 	[Fact]
 	public void ReadsAGaugeOutOfAWellFormedAnswer()
 	{
@@ -84,6 +104,35 @@ public sealed class SnmpParserTests
 		Assert.Equal(0, reply.Error);
 		Assert.True(reply.Vars.ContainsKey(CapacityOid));
 		Assert.Equal(0x42, reply.Vars[CapacityOid].Tag);
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public void DuplicateOidsCannotOverwriteAReading(bool reverse)
+	{
+		var bindings = new[] { Gauge(CapacityOid, 10), Gauge(CapacityOid, 90) };
+		if (reverse) Array.Reverse(bindings);
+		Assert.Null(Sensor().ParseVarBinds(Response(7, 0, 0, Community, bindings), 7));
+	}
+
+	[Fact]
+	public void UnrequestedOidsCannotMakeTheUpsPresent()
+	{
+		const string other = "1.3.6.1.2.1.1.3.0";
+		Assert.Null(Sensor().ParseVarBinds(Response(7, 0, 0, Community, Gauge(other, 90)), 7));
+		var reply = Sensor().ParseVarBinds(Response(7, 0, 0, Community,
+			Gauge(other, 90), Gauge(CapacityOid, 61)), 7);
+		Assert.Equal(CapacityOid, Assert.Single(reply.Vars).Key);
+	}
+
+	[Fact]
+	public void DroppedOidsAreNotAcceptedOnARetry()
+	{
+		const string status = "1.3.6.1.4.1.318.1.1.1.4.1.1.0";
+		var packet = Response(7, 0, 0, Community, Gauge(status, 3));
+		Assert.NotNull(Sensor().ParseVarBinds(packet, 7));
+		Assert.Null(Sensor().ParseVarBinds(packet, 7, new[] { CapacityOid }));
 	}
 
 	[Theory]
@@ -96,7 +145,7 @@ public sealed class SnmpParserTests
 	public void DecodesTheCombinedFirstTwoOidArcs(byte[] oid, string expected)
 	{
 		var binding = Tlv(0x30, Tlv(0x06, oid), Int(61));
-		var reply = Sensor().ParseVarBinds(Response(7, 0, 0, Community, binding), 7);
+		var reply = Sensor().ParseVarBinds(Response(7, 0, 0, Community, binding), 7, new[] { expected });
 		Assert.NotNull(reply);
 		Assert.True(reply.Vars.ContainsKey(expected));
 	}

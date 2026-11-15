@@ -40,6 +40,7 @@ public sealed class HddSensor
 
 	private readonly string _exe;
 	private readonly string _scanArgs;
+	private readonly Func<string, string> _run;
 	private List<(string Device, string Type)> _devices;
 	private long _discoveredAt;
 	private bool? _safe;
@@ -68,7 +69,10 @@ public sealed class HddSensor
 	{
 		_exe = PathOf(tools?.Smartctl);
 		_scanArgs = tools?.SmartctlScan ?? ToolSettings.DefaultScan;
+		_run = Run;
 	}
+
+	internal HddSensor(ToolSettings tools, Func<string, string> run) : this(tools) => _run = run;
 
 	/// <summary>
 	/// The file a configured <c>Tools.Smartctl</c> stands for. README calls smartctl an optional
@@ -164,7 +168,7 @@ public sealed class HddSensor
 		// Nothing answered: the controller or the disks changed, so look again next time. A disk
 		// that answered "asleep" did answer — rescanning for it would only cost another run.
 		if (disks.Count == 0 && asleep == 0) _devices = null;
-		else LastError = null;
+		// LastError was cleared before this pass. A healthy neighbour cannot clear a failed port.
 		AsleepUnseen = unseen;
 		return disks;
 	}
@@ -312,7 +316,7 @@ public sealed class HddSensor
 	/// <summary>Runs smartctl and parses its JSON; null when it did not run or did not answer.</summary>
 	private JsonDocument RunJson(string args)
 	{
-		var output = Run(args);
+		var output = _run(args);
 		if (string.IsNullOrWhiteSpace(output)) return null;
 		try { return JsonDocument.Parse(output); }
 		catch (JsonException ex)

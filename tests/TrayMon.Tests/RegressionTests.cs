@@ -45,6 +45,36 @@ internal sealed class TrayState
 public sealed class RegressionTests
 {
 	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public void RaidPartialFailureSurvivesOtherAnswersAndClearsAfterRecovery(bool failureFirst)
+	{
+		var recover = false;
+		var scans = 0;
+		var tools = new ToolSettings { Smartctl = typeof(HddSensor).Assembly.Location };
+		var hdd = new HddSensor(tools, args =>
+		{
+			if (args.StartsWith("-j --scan", StringComparison.Ordinal))
+			{
+				scans++;
+				return """{"devices":[{"name":"/dev/csmi0,0","type":"csmi"},{"name":"/dev/csmi0,1","type":"csmi"}]}""";
+			}
+			var first = args.EndsWith("/dev/csmi0,0", StringComparison.Ordinal);
+			if (!recover && first == failureFirst) return "not JSON";
+			return first
+				? """{"model_name":"Disk A","serial_number":"A","temperature":{"current":30}}"""
+				: """{"model_name":"Disk B","serial_number":"B","temperature":{"current":35}}""";
+		});
+		TrayState.Set(hdd, "_safe", (bool?)true);
+		Assert.Single(hdd.ReadAll());
+		Assert.Contains("не JSON", hdd.LastError);
+		recover = true;
+		Assert.Equal(2, hdd.ReadAll().Count);
+		Assert.Null(hdd.LastError);
+		Assert.Equal(1, scans);
+	}
+
+	[Theory]
 	[InlineData(Alarm.Normal)]
 	[InlineData(Alarm.Warning)]
 	[InlineData(Alarm.Critical)]

@@ -255,7 +255,7 @@ public sealed class UpsSensor
 			}
 			catch (SocketException) { throw new TimeoutException($"агент не ответил за {_timeoutMs} мс"); }
 
-			var parsed = ParseVarBinds(response, requestId);
+			var parsed = ParseVarBinds(response, requestId, oids);
 			if (parsed is not null) return parsed;
 		}
 	}
@@ -271,8 +271,9 @@ public sealed class UpsSensor
 	/// including the one whose negative TLV length used to walk the cursor backwards and hold a
 	/// logical processor until the process was killed. That is not a bug a tray can demonstrate.
 	/// </remarks>
-	internal SnmpReply ParseVarBinds(byte[] buf, int requestId)
+	internal SnmpReply ParseVarBinds(byte[] buf, int requestId, IReadOnlyList<string> requested = null)
 	{
+		requested ??= _oids;
 		try
 		{
 			var at = 0;
@@ -319,7 +320,11 @@ public sealed class UpsSensor
 				if (bindTag != 0x30 || bindingEnd <= start || bindingEnd > end) return null;
 				var name = ReadValue(buf, ref at, bindingEnd);
 				var value = ReadValue(buf, ref at, bindingEnd);
-				reply.Vars[DecodeOid(name.Raw)] = value;
+				if (name.Tag != 0x06) return null;
+				var oid = DecodeOid(name.Raw);
+				// Only this request's values can establish a reading. Conflicting duplicates are
+				// not an answer: choosing the first or last would make packet order decide it.
+				if (requested.Contains(oid) && !reply.Vars.TryAdd(oid, value)) return null;
 				at = bindingEnd;
 			}
 			// A success with nothing in it answers none of the OIDs asked for. Taken as one, it ended
@@ -416,14 +421,25 @@ public sealed class UpsSensor
 		return string.Join('.', parts);
 	}
 
-	private static byte[] EncodeOid(string oid)
+	internal static byte[] EncodeOid(string oid)
 	{
-		var parts = oid.Split('.').Select(uint.Parse).ToArray();
-		var body = new List<byte> { (byte)(parts[0] * 40 + parts[1]) };
-		for (var i = 2; i < parts.Length; i++)
+		if (string.IsNullOrEmpty(oid)) throw new FormatException("BER: пустой OID");
+		var text = oid.Split('.');
+		var parts = new uint[text.Length];
+		if (parts.Length < 2) throw new FormatException("BER: OID требует две дуги");
+		for (var i = 0; i < parts.Length; i++)
+			if (!uint.TryParse(text[i], System.Globalization.NumberStyles.None,
+				System.Globalization.CultureInfo.InvariantCulture, out parts[i]))
+				throw new FormatException("BER: неверная дуга OID");
+		if (parts[0] > 2 || (parts[0] < 2 && parts[1] >= 40))
+			throw new FormatException("BER: неверный корень OID");
+
+		var body = new List<byte>();
+		for (var i = 1; i < parts.Length; i++)
 		{
 			var group = new List<byte>();
-			var value = parts[i];
+			// The combined first two arcs may exceed both one byte and uint.MaxValue.
+			var value = i == 1 ? 40UL * parts[0] + parts[1] : parts[i];
 			group.Add((byte)(value & 0x7F));
 			value >>= 7;
 			while (value > 0) { group.Insert(0, (byte)((value & 0x7F) | 0x80)); value >>= 7; }

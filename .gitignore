@@ -7,6 +7,8 @@
 bin/
 obj/
 out/
+output/
+.tmp/
 *.user
 
 # runtime files, not part of the source

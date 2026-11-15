@@ -554,6 +554,7 @@ public sealed class Config : IGuidStore
 		{
 			_skipped.Add("Tools.SmartctlScan");
 			Tools.SmartctlScan = ToolSettings.DefaultScan;
+			_dirty = true;
 		}
 	}
 

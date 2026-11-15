@@ -2821,7 +2821,8 @@ internal sealed partial class TrayApp : ApplicationContext, IGuidStore
 	/// <c>.1</c> and <c>.old</c>; in a folder an ordinary user can write to, that user can put a
 	/// junction in its place and send both the writes and the renames anywhere. Refused only when
 	/// the program folder itself is protected — otherwise TrayMon.exe can be replaced just as
-	/// easily, and refusing would only cost the trail. Checked once per path: an ACL does not move.
+	/// easily, and refusing would only cost the trail. Completed ACL checks are cached per path;
+	/// an unreadable ACL is retried so a transient failure cannot become a permanent verdict.
 	/// </summary>
 	private bool LogRefused(string path)
 	{
