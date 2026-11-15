@@ -113,8 +113,9 @@ public sealed class UpsSensor
 		Dictionary<string, (byte Tag, byte[] Raw)> answer = null;
 		try
 		{
-			// At most three passes: each failed one drops exactly the varbind the agent named.
-			for (var attempt = 0; attempt < 3 && answer is null; attempt++)
+			// Every retry removes one unsupported OID; at most all five are queried before
+			// either a supported subset answers or the final unsupported OID fails below.
+			while (answer is null)
 			{
 				var requested = _oids.ToArray();
 				var reply = _query(requested);

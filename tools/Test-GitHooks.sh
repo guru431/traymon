@@ -102,6 +102,55 @@ printf 'refs/heads/main %s refs/heads/main %s\n' "$head" "$zero" \
   | ( cd "$repo" && sh "$hooks/pre-push" origin https://example.invalid/x.git ) >/dev/null 2>&1 || rc=$?
 check "pre-push: clean objects are accepted" 0 "$rc"
 
+# A failed temporary-directory allocation must refuse the scan, without touching a
+# directory left by an earlier invocation. Successful concurrent scans need their
+# own directories inside the repository, even when TMPDIR names a different parent.
+real_mktemp=$(command -v mktemp)
+mkdir -p "$repo/tempbin" "$repo/.pre-push.tmp"
+echo retained > "$repo/.pre-push.tmp/marker"
+cat > "$repo/tempbin/mktemp" <<'SHIM'
+#!/bin/sh
+if [ "${FAIL_MKTEMP:-0}" = 1 ]; then exit 1; fi
+allocated=$("$REAL_MKTEMP" "$@") || exit 1
+printf '%s\n' "$allocated" >> "$TMP_AUDIT"
+printf '%s\n' "$allocated"
+SHIM
+chmod +x "$repo/tempbin/mktemp"
+rc=0
+output=$(printf 'refs/heads/main %s refs/heads/main %s\n' "$head" "$zero" \
+  | ( cd "$repo" && PATH="$repo/tempbin:$PATH" FAIL_MKTEMP=1 \
+      sh "$hooks/pre-push" origin https://example.invalid/x.git ) 2>&1) || rc=$?
+check "pre-push: failed temporary allocation refuses publication" 1 "$rc"
+rc=0
+printf '%s' "$output" | grep -q 'cannot create a temporary directory' || rc=$?
+check "pre-push: temporary allocation failure has a specific diagnostic" 0 "$rc"
+rc=0
+test -f "$repo/.pre-push.tmp/marker" || rc=$?
+check "pre-push: failed allocation preserves a pre-existing fallback directory" 0 "$rc"
+
+for scan in 1 2; do
+  ( printf 'refs/heads/main %s refs/heads/main %s\n' "$head" "$zero" \
+    | ( cd "$repo" && PATH="$repo/tempbin:$PATH" REAL_MKTEMP="$real_mktemp" \
+        TMP_AUDIT="$repo/temp-audit" sh "$hooks/pre-push" origin https://example.invalid/x.git ) \
+      > "$repo/scan-$scan.log" 2>&1 ) &
+  if [ "$scan" -eq 1 ]; then first_scan=$!; else second_scan=$!; fi
+done
+rc=0
+wait "$first_scan" || rc=$?
+check "pre-push: first concurrent scan succeeds" 0 "$rc"
+rc=0
+wait "$second_scan" || rc=$?
+check "pre-push: second concurrent scan succeeds" 0 "$rc"
+unique=$(sort -u "$repo/temp-audit" | wc -l | tr -d ' ')
+check "pre-push: concurrent scans allocate distinct directories" 2 "$unique"
+local_and_removed=0
+scan_root=$(git -C "$repo" rev-parse --show-toplevel)
+while read -r allocated; do
+  case "$allocated" in "$scan_root/.tmp/pre-push."*) ;; *) local_and_removed=1 ;; esac
+  if [ -e "$allocated" ]; then local_and_removed=1; fi
+done < "$repo/temp-audit"
+check "pre-push: scan directories are repository-local and cleaned" 0 "$local_and_removed"
+
 # 7) A token in an annotated tag message is refused — nothing looked at these.
 git -C "$repo" tag -a v0.0.1-test -m "release $token" >/dev/null 2>&1
 tag=$(git -C "$repo" rev-parse v0.0.1-test)

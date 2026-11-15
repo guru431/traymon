@@ -147,6 +147,44 @@ public sealed class ConfigTests : IDisposable
 		Assert.Equal(new[] { "vEthernet" }, net.Filters);
 	}
 
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public void EmptyAdapterListsResetPreviouslyConfiguredPatterns(bool blanks)
+	{
+		var net = new NetSettings { NotPhysical = new() { "custom" }, Include = new() { "VPN" } };
+		net.NotPhysical = null;
+		net.Include = null;
+		Assert.Equal(new[] { "custom" }, net.Filters);
+		Assert.Equal(new[] { "VPN" }, net.Included);
+		var empty = blanks ? new List<string> { "", "  ", null } : new List<string>();
+		net.NotPhysical = empty;
+		net.Include = empty;
+		Assert.Equal(NetSettings.BuiltInNotPhysical, net.Filters);
+		Assert.Empty(net.Included);
+	}
+
+	[Fact]
+	public void ChangingGigabyteThresholdsImmediatelyReevaluatesTheFreshReading()
+	{
+		var state = new TrayState();
+		TrayState.Set(state.App, "_freePool", new GuidPool("test", "free", new[] { Guid.NewGuid() }));
+		state.Readings.Space = new() { ("C:", 200, 1000) };
+		state.Readings.SpaceAt = Environment.TickCount64;
+		TrayState.Set(state.App, "_tick", 1L);
+		state.Call("ShowFreeSpace");
+		var slot = state.Find("free.C:");
+		Assert.Equal(Alarm.Normal, TrayState.Get(slot, "Level"));
+		state.Call("SetGbThresholds", slot, (double?)300, (double?)250);
+		Assert.Equal(Alarm.Critical, TrayState.Get(slot, "Level"));
+		Assert.Contains("порог по остатку", (string)TrayState.Get(slot, "LastDetail"));
+		Assert.Equal(250d, Config.Read().Get("free.C:").CritGb);
+		state.Call("SetGbThresholds", slot, null, null);
+		Assert.Equal(Alarm.Normal, TrayState.Get(slot, "Level"));
+		Assert.DoesNotContain("порог по остатку", (string)TrayState.Get(slot, "LastDetail"));
+		Assert.Equal(200d, TrayState.Get(slot, "LastValue"));
+	}
+
 	[Fact]
 	public void PollIntervalOnlyMovesUpwards()
 	{

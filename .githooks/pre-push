@@ -59,8 +59,11 @@ case "$target_remote" in
   *) excludes="$excludes --remotes=$target_remote" ;;
 esac
 
-tmpdir=$(mktemp -d 2>/dev/null || echo "$repo_root/.pre-push.tmp")
-mkdir -p "$tmpdir"
+# Each scan owns a new directory. A fixed fallback could reuse another scan's
+# files and then delete them; allocation failure must refuse publication instead.
+mkdir -p "$repo_root/.tmp" || { echo 'BLOCKED: cannot create a temporary directory' >&2; exit 1; }
+tmpdir=$(mktemp -d "$repo_root/.tmp/pre-push.XXXXXXXXXX") \
+  || { echo 'BLOCKED: cannot create a temporary directory' >&2; exit 1; }
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
 all="$tmpdir/all"
 objects="$tmpdir/objects"

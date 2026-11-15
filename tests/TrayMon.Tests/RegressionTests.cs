@@ -44,6 +44,118 @@ internal sealed class TrayState
 
 public sealed class RegressionTests
 {
+	[Fact]
+	public void RaidRediscoveryForgetsRemovedPortsButKeepsSleepingPresentDisks()
+	{
+		var stage = 0;
+		var hdd = new HddSensor(new ToolSettings { Smartctl = typeof(HddSensor).Assembly.Location }, args =>
+		{
+			if (args.StartsWith("-j --scan", StringComparison.Ordinal))
+				return stage == 1
+					? """{"devices":[{"name":"/dev/csmi0,1","type":"csmi"}]}"""
+					: """{"devices":[{"name":"/dev/csmi0,0","type":"csmi"},{"name":"/dev/csmi0,1","type":"csmi"}]}""";
+			if (stage > 0) return """{"power_mode":{"name":"STANDBY"}}""";
+			return args.EndsWith("/dev/csmi0,0", StringComparison.Ordinal)
+				? """{"model_name":"Disk A","serial_number":"A","temperature":{"current":30}}"""
+				: """{"model_name":"Disk B","serial_number":"B","temperature":{"current":35}}""";
+		});
+		TrayState.Set(hdd, "_safe", (bool?)true);
+		Assert.Equal(2, hdd.ReadAll().Count);
+		stage = 1;
+		hdd.Rediscover();
+		Assert.Equal("B", Assert.Single(hdd.ReadAll()).Serial);
+		Assert.Single((IDictionary)TrayState.Get(hdd, "_lastAwake"));
+		stage = 2;
+		hdd.Rediscover();
+		var present = Assert.Single(hdd.ReadAll());
+		Assert.Equal("B", present.Serial);
+		Assert.True(present.Asleep);
+		Assert.Equal(1, hdd.AsleepUnseen);
+	}
+
+	[Fact]
+	public void SnmpCanDropFourUnsupportedOidsAndReadTheRemainingGaugeAfterRediscovery()
+	{
+		var counts = new List<int>();
+		var ups = new UpsSensor(new UpsSettings(), requested =>
+		{
+			counts.Add(requested.Count);
+			return requested.Count > 1
+				? new UpsSensor.SnmpReply { Error = 2, ErrorIndex = 2 }
+				: new UpsSensor.SnmpReply { Vars = new() { [requested[0]] = (0x42, new byte[] { 100 }) } };
+		});
+		var readings = new Readings();
+		for (var pass = 0; pass < 2; pass++)
+		{
+			ups.Rediscover();
+			ups.Read(readings);
+			Assert.True(readings.Ups.Answered);
+			Assert.Equal(100d, readings.Ups.Charge);
+			Assert.Contains("4 из пяти", ups.LastError);
+		}
+		Assert.Equal(new[] { 5, 4, 3, 2, 1, 5, 4, 3, 2, 1 }, counts);
+	}
+
+	[Fact]
+	public void SnmpWithNoSupportedOidsStopsAfterFiveRequestsAndClearsTheReading()
+	{
+		var calls = 0;
+		var ups = new UpsSensor(new UpsSettings(), requested =>
+		{
+			calls++;
+			return new UpsSensor.SnmpReply { Error = 2, ErrorIndex = 1 };
+		});
+		var readings = new Readings { Ups = new UpsReading { Answered = true, Charge = 100 } };
+		ups.Read(readings);
+		Assert.Equal(5, calls);
+		Assert.False(readings.Ups.Answered);
+		Assert.Null(readings.Ups.Charge);
+		Assert.Contains("ошибку SNMP 2", ups.LastError);
+	}
+
+	[Theory]
+	[InlineData("PASSED", false, Alarm.Normal)]
+	[InlineData("FAILING_NOW", false, Alarm.Critical)]
+	[InlineData("PASSED", true, Alarm.Normal)]
+	public void AnsweringRaidDiskWithoutTemperatureRemainsAlive(string health, bool asleep, int level)
+	{
+		var state = new TrayState();
+		TrayState.Set(state.App, "_raidPool", new GuidPool("test", "disk.raid", new[] { Guid.NewGuid() }));
+		state.Config.For("disk.raid.A").Required = true;
+		state.Readings.RaidDisks = new() { new RaidDisk("Disk A", null, "A", health) { Asleep = asleep } };
+		state.Readings.RaidAt = Environment.TickCount64;
+		TrayState.Set(state.App, "_raidVersion", 1);
+		for (long tick = 1; tick <= 2; tick++)
+		{
+			TrayState.Set(state.App, "_tick", tick);
+			state.Call("ShowRaidDisks");
+			var slot = state.Find("disk.raid.A");
+			Assert.Equal(tick, TrayState.Get(slot, "SeenTick"));
+			state.Call("Fade");
+			Assert.False((bool)TrayState.Get(slot, "Dead"));
+			Assert.Equal(level, TrayState.Get(slot, "Level"));
+			Assert.Contains(asleep ? "спит" : "температуры нет", (string)TrayState.Get(slot, "LastDetail"));
+		}
+	}
+
+	[Theory]
+	[InlineData(999, "999", false)]
+	[InlineData(1000, "1.0", true)]
+	[InlineData(1024, "1.0", true)]
+	[InlineData(1536, "1.5", true)]
+	public void FreeSpaceUsesBinaryConversionAndSwitchesToCompactUnitsAtAThousand(double freeGb, string text, bool inTb)
+	{
+		var state = new TrayState();
+		TrayState.Set(state.App, "_freePool", new GuidPool("test", "free", new[] { Guid.NewGuid() }));
+		state.Readings.Space = new() { ("C:", freeGb, 10000) };
+		state.Readings.SpaceAt = Environment.TickCount64;
+		TrayState.Set(state.App, "_tick", 1L);
+		state.Call("ShowFreeSpace");
+		var slot = state.Find("free.C:");
+		Assert.Equal(text, TrayState.Get(slot, "LastText"));
+		Assert.Equal(inTb, ((string)TrayState.Get(slot, "DefaultLabel")).Contains("(ТБ)"));
+	}
+
 	[Theory]
 	[InlineData(false)]
 	[InlineData(true)]

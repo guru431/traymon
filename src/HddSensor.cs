@@ -121,6 +121,10 @@ public sealed class HddSensor
 		{
 			_devices = Discover();
 			_discoveredAt = Environment.TickCount64;
+			// A port absent from this scan no longer proves the cached disk's identity.
+			var present = _devices.Select(d => d.Device).ToHashSet(StringComparer.OrdinalIgnoreCase);
+			foreach (var device in _lastAwake.Keys.Where(d => !present.Contains(d)).ToArray())
+				_lastAwake.Remove(device);
 		}
 		var answers = new List<(string Key, RaidDisk Disk)>();
 		var asleep = 0;

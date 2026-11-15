@@ -294,8 +294,9 @@ somebody had deliberately silenced.
 - `Theme` — `light`, `dark` or `null` (system colours), shared by windows and menus. Windows high
   contrast takes priority; native colour and message dialogs use the system theme.
 - `Net.NotPhysical` — **a custom list replaces the built-in one entirely**, which is why it is
-  spelled out in full above. `Net.Include` is the way to keep a VPN or a virtual adapter you do
-  watch without rewriting that list; `Net.Bandwidth` gives the percentage a figure to divide by
+  spelled out in full above. An empty list restores the built-in filters; empty `Net.Include`
+  clears the exceptions. Blank entries are discarded. `Net.Include` is the way to keep a VPN
+  or a virtual adapter you do watch without rewriting that list; `Net.Bandwidth` gives the percentage a figure to divide by
   where the driver leaves `Current Bandwidth` empty or where a Wi-Fi link rate is not a capacity;
   of several substrings matching one adapter, the longest wins. With no link speed the utilisation is not invented: there is no threshold colour and the tooltip
   says the link speed is unknown. A configured bandwidth does not stand in for the link itself: a
@@ -437,7 +438,10 @@ many devices are asleep unidentified. Devices are deduplicated by serial number 
 rediscovered hourly and on "poll now" — one healthy old disk used to hold the old list for ever.
 The same query brings back the SMART health verdict: a failing disk matters more than a warm one,
 so a disk **with no temperature but a bad verdict** gets an icon too. It used to be dropped from
-the list before its health was even looked at.
+the list before its health was even looked at. A healthy disk without a temperature gauge stays
+alive too: its icon shows "—" and the tooltip explains why, alongside its health. Rediscovery
+forgets identities cached for missing ports, so a sleeping disk on a returning port cannot inherit
+the previous disk's name.
 
 **The UPS is asked over SNMP rather than Windows.** An old Smart-UPS on RS-232 is invisible
 to the system — no `Win32_Battery`, no battery-class device. Only the service holding the COM
@@ -445,7 +449,8 @@ port has the readings, and it can republish them over SNMP. Note that APC NMC fi
 later, and PowerChute Business Edition 10 and later, ship with **SNMPv1 disabled** — it has to
 be enabled on the card. A five-OID GET is all-or-nothing, so an agent missing one of them
 answers `noSuchName` and returns nothing at all; the program reads the error index, drops the
-named OID and retries, remembering the working set. **Only `noSuchName` drops a varbind** — any
+named OID and retries, remembering the working set. Even if only one OID is supported, it is read
+in the same poll (at most five requests). **Only `noSuchName` drops a varbind** — any
 other error is the agent having a bad moment, and treating those the same way could cost the charge
 or the power status for the rest of the session. "Poll now" asks for the full set again. Accepted
 numbers are range-checked: a charge of −1 or 200 is not a charge.

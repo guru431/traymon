@@ -133,7 +133,8 @@ public sealed class NetSettings
 	private List<string> _include;
 
 	/// <summary>
-	/// Substrings that mark an adapter as virtual; null keeps the built-in list. Empty and null
+	/// Substrings that mark an adapter as virtual; null leaves the setting alone, an empty list
+	/// restores the built-in filters. Empty and null
 	/// entries are dropped: <c>[""]</c> matches every description and used to hide every adapter,
 	/// and a literal <c>null</c> in the list threw once every six seconds inside the network family.
 	/// </summary>
@@ -142,8 +143,9 @@ public sealed class NetSettings
 		get => _notPhysical;
 		set
 		{
-			var clean = value?.Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
-			if (clean is { Count: > 0 }) _notPhysical = clean;
+			if (value is null) return;
+			var clean = value.Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
+			_notPhysical = clean.Count > 0 ? clean : null;
 		}
 	}
 
@@ -159,8 +161,9 @@ public sealed class NetSettings
 		get => _include;
 		set
 		{
-			var clean = value?.Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
-			if (clean is { Count: > 0 }) _include = clean;
+			if (value is null) return;
+			var clean = value.Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
+			_include = clean.Count > 0 ? clean : null;
 		}
 	}
 

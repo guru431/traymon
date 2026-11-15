@@ -1191,8 +1191,9 @@ internal sealed partial class TrayApp : ApplicationContext, IGuidStore
 			// exactly the publication path the running program uses: Spawn() runs inline while
 			// _dry, so the background readers happen in order on this thread.
 			OnTick(null, EventArgs.Empty);   // through OnTick, so the tick times itself here too
-			foreach (var slot in _order)
+			for (var index = 0; index < _order.Count; index++)
 			{
+				var slot = _order[index];
 				var now = $"{slot.LastText ?? "—"}/{Alarm.Name(slot.Level)}";
 				var known = before.TryGetValue(slot.Id, out var was);
 				before[slot.Id] = now;
@@ -1201,7 +1202,7 @@ internal sealed partial class TrayApp : ApplicationContext, IGuidStore
 				// is worth seeing is what moved afterwards — fading, coming back, changing level.
 				if (i == 0) continue;
 				report.AppendLine($"  tick {(i + 1).ToString(CultureInfo.InvariantCulture)}: " +
-								  $"metric {_order.IndexOf(slot) + 1} {(known ? was : "—")} → {now}");
+								  $"metric {index + 1} {(known ? was : "—")} → {now}");
 			}
 		}
 
@@ -1882,10 +1883,9 @@ internal sealed partial class TrayApp : ApplicationContext, IGuidStore
 			// when there is no temperature at all, which is why the severity is passed even when
 			// the value is missing.
 			var failing = HddSensor.Failing(d.Health);
-			// A sleeping disk is alive and, unless its last answer said otherwise, fine: zero, not
-			// "no value", or it would go grey and a required one would report its data lost each
-			// time it parked.
-			var severity = failing ? NeverAlerts : d.Asleep ? 0 : d.Temp;
+			// A healthy answer proves the disk is alive even without a temperature gauge.
+			// Sleeping disks likewise keep their last known health without a current number.
+			var severity = failing ? NeverAlerts : d.Asleep ? 0 : d.Temp ?? 0;
 			Record(slot, d.Temp, severity, unit: "°C", stamp: _r.RaidAt);
 			if (!changed) continue;
 			var health = string.IsNullOrEmpty(d.Health) ? "" : failing ? $"   ЗДОРОВЬЕ: {d.Health}" : "   здоровье в норме";
@@ -2071,6 +2071,8 @@ internal sealed partial class TrayApp : ApplicationContext, IGuidStore
 			// free space, the drawing code knows steps only up to four characters, and the fifth
 			// was drawn straight off the edge of a 16-pixel icon. The unit moves into the caption,
 			// the way the GPU fan says "(%)" when the driver only gives a duty cycle.
+			// 1000 is the compact-display cutoff, not the conversion factor: SpaceSensor already
+			// reports binary gigabytes, so the numeric conversion below still divides by 1024.
 			var inTb = s.FreeGb >= 1000;
 			slot.DefaultLabel = inTb ? $"Свободно {s.Name} (ТБ)" : $"Свободно {s.Name}";
 			var why = byGb > usedPercent ? "   порог по остатку в ГБ" : "";
@@ -3301,7 +3303,15 @@ internal sealed partial class TrayApp : ApplicationContext, IGuidStore
 				 "Прежние значения оставлены без изменений.", MessageBoxIcon.Warning);
 			return;
 		}
-		Persist(slot, s => { s.WarnGb = w; s.CritGb = c; });
+		SetGbThresholds(slot, w, c);
+	}
+
+	private void SetGbThresholds(IconSlot slot, double? warn, double? crit)
+	{
+		Persist(slot, s => { s.WarnGb = warn; s.CritGb = crit; });
+		// LastSeverity already folds in the old GB thresholds. Recompute it from the cached
+		// fresh reading; pushing the old severity would keep the old colour until the next tick.
+		ShowFreeSpace();
 	}
 
 	/// <summary>Menu items are Components; Clear alone leaves each of them to the finaliser,
