@@ -125,7 +125,7 @@ rc=0
 printf '%s' "$output" | grep -q 'cannot create a temporary directory' || rc=$?
 check "pre-push: temporary allocation failure has a specific diagnostic" 0 "$rc"
 rc=0
-test -f "$repo/.pre-push.tmp/marker" || rc=$?
+test -f "$repo/.pre-push.tmp/marker" || rc=1
 check "pre-push: failed allocation preserves a pre-existing fallback directory" 0 "$rc"
 
 for scan in 1 2; do
